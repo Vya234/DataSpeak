@@ -1,0 +1,28 @@
+/* index.css — imported FIRST in main.jsx
+   Kills Vite scaffold: body { display:flex; place-items:center; min-height:100vh } */
+
+*, *::before, *::after { box-sizing: border-box; }
+
+html { height: auto; font-size: 16px; }
+
+body {
+  margin: 0 !important;
+  padding: 0 !important;
+  height: auto !important;
+  min-height: unset !important;
+  display: block !important;
+  place-items: unset !important;
+  align-items: unset !important;
+  justify-content: unset !important;
+  justify-items: unset !important;
+}
+
+#root {
+  display: block !important;
+  height: auto !important;
+  min-height: unset !important;
+  place-items: unset !important;
+  align-items: unset !important;
+  justify-content: unset !important;
+  justify-items: unset !important;
+}

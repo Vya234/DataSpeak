@@ -1,4 +1,4 @@
-import { useState } from "react";
+import { useState, useEffect } from "react";
 import UploadPanel from "./components/UploadPanel.jsx";
 import ChatPanel from "./components/ChatPanel.jsx";
 import InsightChart from "./components/InsightChart.jsx";
@@ -11,7 +11,7 @@ const FRIENDLY_ERROR = "⚠️ Unable to process request. Please try again.";
 const WELCOME_MESSAGE = {
   role: "assistant",
   content:
-    "Upload a CSV to get started. Then ask questions like “What are the top 5 categories by sales?”",
+    'Upload a CSV to get started. Then ask questions like "What are the top 5 categories by sales?"',
 };
 
 export default function App() {
@@ -20,6 +20,13 @@ export default function App() {
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState("");
   const [chartData, setChartData] = useState(null);
+
+
+  // Scroll to very top of page on first load
+  useEffect(() => {
+    document.documentElement.scrollTop = 0;
+    document.body.scrollTop = 0;
+  }, []);
 
   const canQuery = Boolean(datasetInfo);
 
@@ -32,10 +39,7 @@ export default function App() {
 
     setLoading(true);
     try {
-      const res = await fetch(`${API_URL}/upload`, {
-        method: "POST",
-        body: form,
-      });
+      const res = await fetch(`${API_URL}/upload`, { method: "POST", body: form });
       const data = await res.json();
       if (!res.ok) throw new Error(data?.error || "Upload failed");
 
@@ -44,7 +48,7 @@ export default function App() {
         ...prev,
         {
           role: "assistant",
-          content: `Loaded **${data.dataset.originalName}** with **${data.dataset.rowCount}** rows.`,
+          content: `Loaded **${data.dataset.originalName}** — **${data.dataset.rowCount}** rows, **${data.dataset.columns.length}** columns.`,
         },
       ]);
       return true;
@@ -81,7 +85,8 @@ export default function App() {
       const data = await res.json();
       if (!res.ok) throw new Error(data?.error || "Query failed");
 
-      const source = data.source === "rule-based" || data.source === "AI" ? data.source : undefined;
+      const source =
+        data.source === "rule-based" || data.source === "AI" ? data.source : undefined;
       setMessages((prev) => [
         ...prev,
         {
@@ -90,6 +95,7 @@ export default function App() {
           ...(source ? { source } : {}),
         },
       ]);
+
       const cd = data.chartData;
       if (
         cd &&
@@ -104,10 +110,7 @@ export default function App() {
       setError(FRIENDLY_ERROR);
       setMessages((prev) => [
         ...prev,
-        {
-          role: "assistant",
-          content: FRIENDLY_ERROR,
-        },
+        { role: "assistant", content: FRIENDLY_ERROR },
       ]);
     } finally {
       setLoading(false);
@@ -117,15 +120,21 @@ export default function App() {
   return (
     <div className="app">
       <header className="header">
+        <div className="header-logo" aria-hidden>
+          <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="white" strokeWidth="2.2">
+            <polyline points="22 12 18 12 15 21 9 3 6 12 2 12" />
+          </svg>
+        </div>
         <div>
           <h1>DataSpeak</h1>
-          <p className="subtle">AI-powered “Talk to Data” for CSVs.</p>
+          <p className="subtle" style={{ margin: 0 }}>AI-powered natural language queries for CSV files</p>
         </div>
       </header>
 
       <main className="grid">
+        {/* Panel 1 — Upload */}
         <section className="card">
-          <h2>1) Upload CSV</h2>
+          <h2>Dataset</h2>
           <UploadPanel
             onUpload={handleUpload}
             onReset={handleResetUpload}
@@ -140,26 +149,28 @@ export default function App() {
               </div>
               <div className="row">
                 <span className="label">Rows</span>
-                <span className="value">{datasetInfo.rowCount}</span>
+                <span className="value">{datasetInfo.rowCount.toLocaleString()}</span>
               </div>
               <div className="row">
-                <span className="label">Columns</span>
-                <span className="value">{datasetInfo.columns.join(", ")}</span>
+                <span className="label">Cols</span>
+                <span className="value">{datasetInfo.columns.length}</span>
               </div>
               <DatasetPreview
                 columns={datasetInfo.columns}
-                rows={(datasetInfo.sampleRows || []).slice(0, 5)}
+                rows={datasetInfo.sampleRows || []}
+                totalRows={datasetInfo.rowCount}
               />
             </div>
           ) : (
-            <p className="subtle">
-              Your CSV is parsed on the server and stored in memory for this session.
+            <p className="subtle" style={{ marginTop: 12 }}>
+              CSV is parsed server-side and held in memory for this session.
             </p>
           )}
         </section>
 
+        {/* Panel 2 — Chat */}
         <section className="card">
-          <h2>2) Ask questions</h2>
+          <h2>Ask your data</h2>
           <ChatPanel
             messages={messages}
             onAsk={handleAsk}
@@ -169,17 +180,21 @@ export default function App() {
           {error ? <p className="error">{error}</p> : null}
         </section>
 
+        {/* Panel 3 — Chart */}
         <section className="card">
-          <h2>3) Chart (optional)</h2>
-          <InsightChart chartData={chartData} title={chartData ? "Comparison" : null} />
-          {!chartData ? <p className="subtle">Charts appear when the AI returns chart data.</p> : null}
+          <h2>Visualize</h2>
+          <InsightChart chartData={chartData} title={chartData ? "Result Chart" : null} />
+          {!chartData && (
+            <p className="subtle">
+              Charts appear automatically when a query returns numeric data. Click to expand.
+            </p>
+          )}
         </section>
       </main>
 
       <footer className="footer subtle">
-        Built for hackathons: upload CSV → ask → get insights (+ optional charts).
+        DataSpeak · Upload a CSV, ask questions, get insights.
       </footer>
     </div>
   );
 }
-

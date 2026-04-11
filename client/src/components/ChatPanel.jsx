@@ -13,9 +13,23 @@ function SourceBadge({ source }) {
     return <span className="sourceBadge sourceBadgeRule">⚡ Computed</span>;
   }
   if (source === "AI") {
-    return <span className="sourceBadge sourceBadgeAi">🤖 AI Insight</span>;
+    return <span className="sourceBadge sourceBadgeAi">✦ AI Insight</span>;
   }
   return null;
+}
+
+function TypingIndicator() {
+  return (
+    <div className="msg" style={{ marginBottom: 14 }}>
+      <div className="msgInner">
+        <div className="typingBubble">
+          <div className="typingDot" />
+          <div className="typingDot" />
+          <div className="typingDot" />
+        </div>
+      </div>
+    </div>
+  );
 }
 
 export default function ChatPanel({ messages, onAsk, disabled, loading }) {
@@ -28,9 +42,17 @@ export default function ChatPanel({ messages, onAsk, disabled, loading }) {
 
   async function submit(e) {
     e.preventDefault();
-    const q = input;
+    const q = input.trim();
+    if (!q) return;
     setInput("");
     await onAsk(q);
+  }
+
+  function handleKeyDown(e) {
+    if (e.key === "Enter" && !e.shiftKey) {
+      e.preventDefault();
+      submit(e);
+    }
   }
 
   return (
@@ -39,40 +61,52 @@ export default function ChatPanel({ messages, onAsk, disabled, loading }) {
         {messages.map((m, idx) => (
           <div key={idx} className={`msg ${m.role}`}>
             <div className="msgInner">
-              {m.role === "assistant" && m.source ? (
+              {m.role === "assistant" && m.source && (
                 <SourceBadge source={m.source} />
-              ) : null}
-              <div
-                className={
-                  m.role === "user"
-                    ? "bubble bubbleUser"
-                    : "bubble bubbleAssistant"
-                }
-              >
+              )}
+              <div className={m.role === "user" ? "bubble bubbleUser" : "bubble bubbleAssistant"}>
                 {renderRichText(m.content)}
               </div>
             </div>
           </div>
         ))}
+        {loading && <TypingIndicator />}
+        <div ref={endRef} />
       </div>
-      <div ref={endRef} />
-      <form className="chatForm" onSubmit={submit}>
+
+      <div className="chatInputWrap">
         <input
           className="chatInput"
           value={input}
-          placeholder={
-            disabled ? "Upload a CSV to enable questions…" : "Ask a question about your data…"
-          }
+          placeholder={disabled ? "Upload a CSV first…" : "Ask anything about your data…"}
           onChange={(e) => setInput(e.target.value)}
-          disabled={disabled}
+          onKeyDown={handleKeyDown}
+          disabled={disabled || loading}
+          autoComplete="off"
         />
-        <button className="button" type="submit" disabled={disabled || !input.trim()}>
-          {loading ? "Thinking…" : "Send"}
+        <button
+          className="chatSendBtn"
+          onClick={submit}
+          disabled={disabled || loading || !input.trim()}
+          type="button"
+        >
+          {loading ? (
+            <>
+              <span style={{ fontSize: 13 }}>···</span>
+            </>
+          ) : (
+            <>
+              Send
+              <svg width="13" height="13" viewBox="0 0 24 24" fill="currentColor">
+                <path d="M2 21l21-9L2 3v7l15 2-15 2v7z" />
+              </svg>
+            </>
+          )}
         </button>
-      </form>
+      </div>
+
       <p className="subtle chatTip">
-        Tip: Try totals, averages, highest/lowest, ranges, or ask for a <strong>chart</strong> of a
-        numeric column.
+        Try totals, averages, top N, or ask to <strong>chart</strong> a column.
       </p>
     </div>
   );
