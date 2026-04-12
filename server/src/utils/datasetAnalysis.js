@@ -557,6 +557,120 @@ function detectGroupColumn(rows, columns, numericCols) {
   return candidates[0] || null;
 }
 
+/** 0–1: share of non-empty cells that parse to a positive sortKey (date-like). */
+function dateColumnScore(rows, col) {
+  if (!Array.isArray(rows) || !col) return 0;
+  let nonempty = 0;
+  let good = 0;
+  for (const row of rows) {
+    const raw = String(row?.[col] ?? "").trim();
+    if (!raw) continue;
+    nonempty++;
+    if (parseDateToken(raw).sortKey > 0) good++;
+  }
+  if (nonempty === 0) return 0;
+  return good / nonempty;
+}
+
+/**
+ * Coarse grain of a date column: used to refuse WoW on monthly-only files.
+ * Heuristic: few distinct calendar days per month-bucket → "month"; many → "day".
+ */
+function inferDatasetTemporalGranularity(rows, dateCol) {
+  if (!Array.isArray(rows) || !dateCol) return { grain: "unknown" };
+  const sks = rows
+    .map((r) => parseDateToken(String(r?.[dateCol] ?? "").trim()).sortKey)
+    .filter((k) => k > 0);
+  if (sks.length < 2) return { grain: "unknown" };
+  const monthBuckets = new Set(sks.map((sk) => Math.floor(sk / 100) * 100));
+  const uniqueDays = new Set(sks).size;
+  const ratio = uniqueDays / Math.max(1, monthBuckets.size);
+  if (ratio < 3) return { grain: "month" };
+  if (ratio < 12) return { grain: "week" };
+  return { grain: "day" };
+}
+
+/**
+ * Per-row month bucket sort key (YYYYMM00), aligned with `rows` indices.
+ * Used by timeResolver for calendar windows; null when the cell is not parseable.
+ */
+function computeOrderedMonthBucketKeys(rows, dateCol) {
+  if (!Array.isArray(rows) || !dateCol) return [];
+  return rows.map((row) => {
+    const raw = String(row?.[dateCol] ?? "").trim();
+    if (!raw) return null;
+    const { sortKey } = parseDateToken(raw);
+    if (sortKey > 0) return Math.floor(sortKey / 100) * 100;
+    return null;
+  });
+}
+
+/**
+ * Categorical pairs where each value of A maps to exactly one value of B (and vice versa) — structural redundancy.
+ */
+function findPerfectCategoricalCorrelations(rows, columns, numericSet) {
+  const cats = (columns || []).filter((c) => c && !numericSet.has(c));
+  const out = [];
+  for (let i = 0; i < cats.length; i++) {
+    for (let j = i + 1; j < cats.length; j++) {
+      const ca = cats[i];
+      const cb = cats[j];
+      const aToB = new Map();
+      const bToA = new Map();
+      let ok = true;
+      for (const row of rows || []) {
+        const a = String(row?.[ca] ?? "").trim();
+        const b = String(row?.[cb] ?? "").trim();
+        if (!a || !b) {
+          ok = false;
+          break;
+        }
+        if (aToB.has(a) && aToB.get(a) !== b) {
+          ok = false;
+          break;
+        }
+        if (bToA.has(b) && bToA.get(b) !== a) {
+          ok = false;
+          break;
+        }
+        aToB.set(a, b);
+        bToA.set(b, a);
+      }
+      if (ok && aToB.size >= 2) {
+        out.push({ colA: ca, colB: cb, mappingSize: aToB.size });
+      }
+    }
+  }
+  return out;
+}
+
+/** Pearson r on paired numeric values; deterministic correlation path. */
+function pearsonCorrelation(rows, colX, colY) {
+  const pairs = [];
+  for (const row of rows || []) {
+    const x = parseNumber(row?.[colX]);
+    const y = parseNumber(row?.[colY]);
+    if (x !== null && y !== null) pairs.push({ x, y });
+  }
+  const n = pairs.length;
+  if (n < 3) return { r: null, n, sufficient: false, reason: "n_lt_3" };
+  const meanX = pairs.reduce((a, p) => a + p.x, 0) / n;
+  const meanY = pairs.reduce((a, p) => a + p.y, 0) / n;
+  let num = 0;
+  let sxx = 0;
+  let syy = 0;
+  for (const p of pairs) {
+    const dx = p.x - meanX;
+    const dy = p.y - meanY;
+    num += dx * dy;
+    sxx += dx * dx;
+    syy += dy * dy;
+  }
+  if (sxx === 0 || syy === 0) return { r: null, n, sufficient: false, reason: "zero_variance" };
+  const r = num / Math.sqrt(sxx * syy);
+  return { r, n, sufficient: true, reason: null };
+}
+
 module.exports = {
   parseNumber,
   numericDensity,
@@ -581,4 +695,9 @@ module.exports = {
   representativeSample,
   detectTemporalColumn,
   detectGroupColumn,
+  dateColumnScore,
+  inferDatasetTemporalGranularity,
+  computeOrderedMonthBucketKeys,
+  pearsonCorrelation,
+  findPerfectCategoricalCorrelations,
 };

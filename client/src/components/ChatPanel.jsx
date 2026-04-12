@@ -1,5 +1,12 @@
 import { useEffect, useRef, useState } from "react";
 
+function stripTrailingDataUsedBlock(text) {
+  return String(text || "")
+    .replace(/\n\n─────────────────────[\s\S]*─────────────────────\s*$/m, "")
+    .replace(/\n\n✓ Verified[^\n]*$/m, "")
+    .trim();
+}
+
 function renderRichText(text) {
   const safe = String(text || "");
   const parts = safe.split("**");
@@ -18,16 +25,66 @@ function SourceBadge({ source }) {
   return null;
 }
 
-function TypingIndicator() {
+function AnswerSkeleton() {
   return (
-    <div className="msg" style={{ marginBottom: 14 }}>
+    <div className="msg assistant" style={{ marginBottom: 14 }}>
       <div className="msgInner">
-        <div className="typingBubble">
-          <div className="typingDot" />
-          <div className="typingDot" />
-          <div className="typingDot" />
+        <div className="analyseSkeleton">
+          <p className="analyseSkeletonTitle">Analysing your data…</p>
+          <div className="analyseSkeletonBar" />
+          <div className="analyseSkeletonBar short" />
         </div>
       </div>
+    </div>
+  );
+}
+
+function DataUsedBlock({ dataUsed }) {
+  if (!dataUsed) return null;
+  const cols = Array.isArray(dataUsed.columnsUsed) ? dataUsed.columnsUsed.join(", ") : "";
+  const filter = dataUsed.filter || "none";
+  const time = dataUsed.timeWindow || "none";
+  const rows = `${dataUsed.rowCount ?? 0} of ${dataUsed.totalRows ?? 0}`;
+  return (
+    <details className="dataUsedDetails">
+      <summary>Data used</summary>
+      <div className="dataUsedBody">
+        <div>
+          <span className="dataUsedKey">Columns</span>
+          <span className="dataUsedVal">{cols || "—"}</span>
+        </div>
+        <div>
+          <span className="dataUsedKey">Filter</span>
+          <span className="dataUsedVal">{filter}</span>
+        </div>
+        <div>
+          <span className="dataUsedKey">Time</span>
+          <span className="dataUsedVal">{time}</span>
+        </div>
+        <div>
+          <span className="dataUsedKey">Rows</span>
+          <span className="dataUsedVal">{rows}</span>
+        </div>
+      </div>
+    </details>
+  );
+}
+
+function FollowUpChips({ questions, onPick, disabled }) {
+  if (!questions?.length) return null;
+  return (
+    <div className="followUpChips">
+      {questions.map((q) => (
+        <button
+          key={q}
+          type="button"
+          className="followUpChip"
+          disabled={disabled}
+          onClick={() => onPick(q)}
+        >
+          {q}
+        </button>
+      ))}
     </div>
   );
 }
@@ -65,12 +122,26 @@ export default function ChatPanel({ messages, onAsk, disabled, loading }) {
                 <SourceBadge source={m.source} />
               )}
               <div className={m.role === "user" ? "bubble bubbleUser" : "bubble bubbleAssistant"}>
-                {renderRichText(m.content)}
+                {renderRichText(
+                  m.role === "assistant" && m.dataUsed
+                    ? stripTrailingDataUsedBlock(m.content)
+                    : m.content
+                )}
               </div>
+              {m.role === "assistant" && (m.dataUsed || m.suggestedQuestions?.length) ? (
+                <>
+                  <DataUsedBlock dataUsed={m.dataUsed} />
+                  <FollowUpChips
+                    questions={m.suggestedQuestions}
+                    onPick={(q) => onAsk(q)}
+                    disabled={disabled || loading}
+                  />
+                </>
+              ) : null}
             </div>
           </div>
         ))}
-        {loading && <TypingIndicator />}
+        {loading && <AnswerSkeleton />}
         <div ref={endRef} />
       </div>
 
@@ -91,9 +162,7 @@ export default function ChatPanel({ messages, onAsk, disabled, loading }) {
           type="button"
         >
           {loading ? (
-            <>
-              <span style={{ fontSize: 13 }}>···</span>
-            </>
+            <span style={{ fontSize: 13 }}>···</span>
           ) : (
             <>
               Send
@@ -106,7 +175,7 @@ export default function ChatPanel({ messages, onAsk, disabled, loading }) {
       </div>
 
       <p className="subtle chatTip">
-        Try totals, averages, top N, or ask to <strong>chart</strong> a column.
+        Try totals, comparisons, or <strong>why</strong> questions with your date column.
       </p>
     </div>
   );

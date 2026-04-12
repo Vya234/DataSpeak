@@ -3,6 +3,8 @@
  * FIX: supports multi-value filters (Electronics + Furniture)
  */
 
+const { extractEntityPair, isRelativeTimeEntityPair } = require("../services/intentParser");
+
 const STOP_WORDS = new Set([
   "what","which","who","where","when","why","how",
   "is","are","was","were","be","been","being",
@@ -89,13 +91,17 @@ function applyFilters(rows, filters) {
 }
 
 function filterDataset({ question, rows, columns, numericColumns }) {
-  const filters = extractFilters(question, rows, columns, numericColumns);
+  let filters = extractFilters(question, rows, columns, numericColumns);
+  const pair = extractEntityPair(question);
+  if (pair && !isRelativeTimeEntityPair(pair) && /\bvs\.?\b|\bversus\b/i.test(question)) {
+    filters = [];
+  }
   const filteredRows = applyFilters(rows, filters);
 
   return {
     filteredRows,
     filters,
-    filterDescription: filters.map(f => `${f.col}=${f.value}`).join(", ")
+    filterDescription: filters.map((f) => `${f.col}=${f.value}`).join(", "),
   };
 }
 

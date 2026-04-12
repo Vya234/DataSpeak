@@ -433,20 +433,20 @@ h2 {
   font-family: 'DM Sans', sans-serif;
 }
 
-/* Header cells — static so sticky thead never bleeds out of card */
+/* Header cells — sticky while scrolling the preview / modal body */
 .dataTable thead th {
-  position: static;
-  top: auto;
-  z-index: 1;
+  position: sticky;
+  top: 0;
+  z-index: 10;
   padding: 8px 14px;
   white-space: nowrap;
   font-size: 10px;
   font-weight: 700;
   letter-spacing: 0.08em;
   text-transform: uppercase;
-  color: var(--text-2);
-  background: #0c0c18;
-  border-bottom: 1px solid var(--border-hi);
+  color: rgba(244, 244, 252, 0.92);
+  background: #141428;
+  border-bottom: 2px solid rgba(99, 102, 241, 0.35);
   overflow: hidden;
   text-overflow: ellipsis;
   min-width: 90px;
@@ -456,17 +456,21 @@ h2 {
 
 /* Row-number th — must NOT inherit uppercase/letter-spacing */
 .dataTable thead th.dataTableRowNum {
+  position: sticky;
+  left: 0;
+  z-index: 11;
   font-size: 10px !important;
-  font-weight: 400 !important;
+  font-weight: 600 !important;
   letter-spacing: 0 !important;
   text-transform: none !important;
-  color: var(--text-3) !important;
+  color: rgba(200, 200, 220, 0.9) !important;
   text-align: center !important;
   min-width: 0 !important;
   width: 32px !important;
   max-width: 36px !important;
   padding: 8px 8px !important;
   border-right: 1px solid var(--border) !important;
+  background: #141428 !important;
 }
 
 /* Body cells */
@@ -561,7 +565,9 @@ h2 {
 }
 
 .expandModalBody {
+  max-height: min(70vh, 520px);
   overflow-x: auto;
+  overflow-y: auto;
   scrollbar-width: thin;
   scrollbar-color: var(--border-hi) transparent;
 }
@@ -569,11 +575,16 @@ h2 {
 .expandModalBody::-webkit-scrollbar-thumb { background: var(--border-hi); border-radius: 4px; }
 
 .expandModalTable thead th {
-  position: static !important;
+  position: sticky;
+  top: 0;
+  z-index: 10;
   padding: 11px 18px;
   font-size: 11px;
+  font-weight: 700;
   min-width: 120px;
-  background: #0c0c18;
+  color: rgba(244, 244, 252, 0.95);
+  background: #141428;
+  border-bottom: 2px solid rgba(99, 102, 241, 0.35);
 }
 
 .expandModalTable tbody td {
@@ -753,6 +764,95 @@ h2 {
 }
 .typingDot:nth-child(2) { animation-delay: 0.2s; }
 .typingDot:nth-child(3) { animation-delay: 0.4s; }
+
+/* Answer skeleton */
+.analyseSkeleton {
+  background: var(--card);
+  border: 1px solid var(--border-hi);
+  border-radius: 4px 14px 14px 14px;
+  padding: 14px 16px 16px;
+  max-width: 100%;
+}
+.analyseSkeletonTitle {
+  font-size: 12.5px;
+  color: var(--text-2);
+  margin-bottom: 12px;
+  font-weight: 500;
+}
+.analyseSkeletonBar {
+  height: 10px;
+  border-radius: 5px;
+  background: linear-gradient(90deg, var(--border) 0%, var(--border-hi) 50%, var(--border) 100%);
+  background-size: 200% 100%;
+  animation: shimmer 1.4s ease-in-out infinite;
+  margin-bottom: 8px;
+}
+.analyseSkeletonBar.short { width: 65%; }
+@keyframes shimmer {
+  0% { background-position: 100% 0; }
+  100% { background-position: -100% 0; }
+}
+
+.dataUsedDetails {
+  margin-top: 10px;
+  font-size: 11.5px;
+  color: var(--text-2);
+  border: 1px solid var(--border);
+  border-radius: var(--r-sm);
+  padding: 0 10px;
+  background: rgba(0,0,0,0.2);
+}
+.dataUsedDetails summary {
+  cursor: pointer;
+  padding: 8px 4px;
+  font-weight: 600;
+  color: var(--text-2);
+  list-style: none;
+}
+.dataUsedDetails summary::-webkit-details-marker { display: none; }
+.dataUsedBody {
+  padding: 0 4px 10px;
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  font-family: 'DM Mono', monospace;
+  font-size: 11px;
+}
+.dataUsedBody > div {
+  display: grid;
+  grid-template-columns: 56px 1fr;
+  gap: 8px;
+  align-items: start;
+}
+.dataUsedKey { color: var(--text-3); }
+.dataUsedVal { color: var(--text); word-break: break-word; }
+
+.followUpChips {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 7px;
+  margin-top: 10px;
+}
+.followUpChip {
+  font-size: 11px;
+  font-family: inherit;
+  padding: 6px 11px;
+  border-radius: 999px;
+  border: 1px solid rgba(99,102,241,0.35);
+  background: var(--accent-glow);
+  color: var(--accent);
+  cursor: pointer;
+  font-weight: 500;
+  transition: background 0.15s, transform 0.1s;
+}
+.followUpChip:hover:not(:disabled) {
+  background: rgba(99,102,241,0.22);
+  transform: scale(1.02);
+}
+.followUpChip:disabled {
+  opacity: 0.45;
+  cursor: not-allowed;
+}
 
 /* Input row */
 .chatInputWrap {

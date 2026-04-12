@@ -16,14 +16,8 @@ if (resultRoot.error && !process.env.GROQ_API_KEY) {
   );
 }
 
-const rawKey = process.env.GROQ_API_KEY;
-const key = typeof rawKey === "string" ? rawKey.trim() : "";
-if (key) {
-  const masked =
-    key.length <= 10 ? `${key.slice(0, 2)}… (${key.length} chars)` : `${key.slice(0, 7)}…${key.slice(-4)} (${key.length} chars)`;
-  console.log(`[DataSpeak] GROQ_API_KEY loaded: ${masked}`);
-} else {
-  console.warn("[DataSpeak] GROQ_API_KEY is missing or empty after dotenv — set it in dataspeak/.env");
+if (!process.env.GROQ_API_KEY?.trim()) {
+  console.warn("[DataSpeak] GROQ_API_KEY is missing — set it in .env (see .env.example).");
 }
 
 const express = require("express");

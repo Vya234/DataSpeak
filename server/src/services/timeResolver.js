@@ -633,6 +633,375 @@ function previousCalendarQuarter(y, q) {
   return { y, q: q - 1 };
 }
 
+const MONTH_NAME_RE =
+  "january|february|march|april|may|june|july|august|september|october|november|december|jan\\.?|feb\\.?|mar\\.?|apr\\.?|jun\\.?|jul\\.?|aug\\.?|sep\\.?|sept\\.?|oct\\.?|nov\\.?|dec\\.?";
+
+function monthIndexFromToken(tok) {
+  const t = String(tok || "")
+    .toLowerCase()
+    .replace(/\./g, "")
+    .replace(/^sept$/, "sep");
+  const map = {
+    january: 1,
+    jan: 1,
+    february: 2,
+    feb: 2,
+    march: 3,
+    mar: 3,
+    april: 4,
+    apr: 4,
+    may: 5,
+    june: 6,
+    jun: 6,
+    july: 7,
+    jul: 7,
+    august: 8,
+    aug: 8,
+    september: 9,
+    sep: 9,
+    sept: 9,
+    october: 10,
+    oct: 10,
+    november: 11,
+    nov: 11,
+    december: 12,
+    dec: 12,
+  };
+  return map[t] || null;
+}
+
+function yearsHavingMonth(rows, dateCol, monthIndex) {
+  const ys = new Set();
+  for (const row of rows) {
+    const k = rowSortKey(row, dateCol);
+    if (k <= 0) continue;
+    const mo = Math.floor((k % 10000) / 100);
+    if (mo === monthIndex) ys.add(Math.floor(k / 10000));
+  }
+  return [...ys].sort((a, b) => a - b);
+}
+
+function hasRowsInMonthYear(rows, dateCol, y, monthIndex) {
+  const start = ymdToSortKey(y, monthIndex, 1);
+  const end = ymdToSortKey(y, monthIndex, daysInMonth(y, monthIndex));
+  for (const row of rows) {
+    const k = rowSortKey(row, dateCol);
+    if (k >= start && k <= end) return true;
+  }
+  return false;
+}
+
+function explicitMonthWindow(y, monthIndex) {
+  const start = ymdToSortKey(y, monthIndex, 1);
+  const end = ymdToSortKey(y, monthIndex, daysInMonth(y, monthIndex));
+  const labelNames = [
+    "January",
+    "February",
+    "March",
+    "April",
+    "May",
+    "June",
+    "July",
+    "August",
+    "September",
+    "October",
+    "November",
+    "December",
+  ];
+  const name = labelNames[monthIndex - 1] || `Month ${monthIndex}`;
+  return {
+    label: `${name} ${y}`,
+    start,
+    end,
+    grain: "month",
+    mode: "explicit_calendar_month",
+  };
+}
+
+/**
+ * Collect explicit calendar month mentions (with optional years) in left-to-right order.
+ * @returns {{ mo: number, year: number|null, pos: number }[]}
+ */
+function collectExplicitCalendarMonthHits(lower) {
+  const hits = [];
+  const reYearFirst = new RegExp(`\\b(20\\d{2})\\s*,?\\s*(${MONTH_NAME_RE})\\b`, "gi");
+  let m;
+  while ((m = reYearFirst.exec(lower)) !== null) {
+    const mo = monthIndexFromToken(m[2]);
+    if (mo) hits.push({ mo, year: Number(m[1]), pos: m.index, len: m[0].length });
+  }
+  const reMonthFirst = new RegExp(`\\b(${MONTH_NAME_RE})\\s*,?\\s*(20\\d{2})\\b`, "gi");
+  while ((m = reMonthFirst.exec(lower)) !== null) {
+    const mo = monthIndexFromToken(m[1]);
+    if (mo) hits.push({ mo, year: Number(m[2]), pos: m.index, len: m[0].length });
+  }
+  const seenKey = new Set();
+  const deduped = [];
+  for (const h of hits) {
+    const k = `${h.pos}|${h.mo}|${h.year}`;
+    if (seenKey.has(k)) continue;
+    seenKey.add(k);
+    deduped.push(h);
+  }
+  hits.length = 0;
+  hits.push(...deduped);
+  hits.sort((a, b) => a.pos - b.pos);
+  const used = new Array(lower.length).fill(false);
+  for (const h of hits) {
+    for (let i = h.pos; i < h.pos + h.len; i++) used[i] = true;
+  }
+  const reMonthOnly = new RegExp(`\\b(${MONTH_NAME_RE})\\b`, "gi");
+  while ((m = reMonthOnly.exec(lower)) !== null) {
+    let overlap = false;
+    for (let i = m.index; i < m.index + m[0].length; i++) {
+      if (used[i]) {
+        overlap = true;
+        break;
+      }
+    }
+    if (overlap) continue;
+    const mo = monthIndexFromToken(m[1]);
+    if (mo) hits.push({ mo, year: null, pos: m.index, len: m[0].length });
+  }
+  hits.sort((a, b) => a.pos - b.pos);
+  const out = [];
+  for (const h of hits) {
+    if (!out.length || out[out.length - 1].mo !== h.mo || out[out.length - 1].year !== h.year) {
+      out.push({ mo: h.mo, year: h.year, pos: h.pos });
+    }
+  }
+  return out;
+}
+
+function betweenTwoMonthsMatch(lower) {
+  const m = lower.match(
+    new RegExp(`\\bbetween\\s+(${MONTH_NAME_RE})\\s+and\\s+(${MONTH_NAME_RE})\\b`, "i")
+  );
+  if (!m) return null;
+  const mo1 = monthIndexFromToken(m[1]);
+  const mo2 = monthIndexFromToken(m[2]);
+  if (!mo1 || !mo2) return null;
+  return { mo1, mo2 };
+}
+
+function versusTwoMonthsMatch(lower) {
+  const m = lower.match(
+    new RegExp(`\\b(${MONTH_NAME_RE})\\s+(?:vs\\.?|versus|compared\\s+to)\\s+(${MONTH_NAME_RE})\\b`, "i")
+  );
+  if (!m) return null;
+  const mo1 = monthIndexFromToken(m[1]);
+  const mo2 = monthIndexFromToken(m[2]);
+  if (!mo1 || !mo2) return null;
+  return { mo1, mo2 };
+}
+
+function latestYearWithBothMonths(rows, dateCol, mo1, mo2) {
+  const y1 = new Set(yearsHavingMonth(rows, dateCol, mo1));
+  const y2 = new Set(yearsHavingMonth(rows, dateCol, mo2));
+  let best = null;
+  for (const y of y1) {
+    if (y2.has(y) && (best === null || y > best)) best = y;
+  }
+  return best;
+}
+
+/**
+ * When the user names calendar month(s) (e.g. "February", "Feb vs March"), anchor windows
+ * to those months in the file — not the default latest dataset period.
+ */
+function parseIsoYearMonthToken(lower) {
+  const m = String(lower || "").match(/\b(20\d{2})[-/](0?[1-9]|1[0-2])\b/);
+  if (!m) return null;
+  const y = Number(m[1]);
+  const mo = Number(m[2]);
+  if (mo < 1 || mo > 12) return null;
+  return { y, mo };
+}
+
+/**
+ * Why / change questions about a single named month compare that month to the prior calendar month
+ * (e.g. February vs January), not dataset-latest vs dataset-latest.
+ */
+function wantsExplicitMonthPeriodDriver(lower) {
+  return (
+    /\b(why|what caused|what drove)\b/i.test(lower) &&
+    /\b(drop|drops|dropped|decrease|decreas|increase|increas|rose|fall|falls|fell|grew|grow|change|changed|declin|higher|lower|worse|better)\b/i.test(
+      lower
+    )
+  );
+}
+
+/** Causal / ROI questions naming one month still need the prior month for comparison. */
+function wantsSingleNamedMonthPriorWindow(lower) {
+  if (wantsExplicitMonthPeriodDriver(lower)) return true;
+  if (
+    /\b(did|does|do)\b/i.test(lower) &&
+    /\bcause\b/i.test(lower) &&
+    /\b(drop|drops|dropped|decrease|declin|change|cut|cutting|spend|revenue|roi|improv)\b/i.test(lower)
+  ) {
+    return true;
+  }
+  if (/\broi\b|\broas\b|return on ad|ad spend efficiency/i.test(lower)) return true;
+  if (/\bcutting\b/i.test(lower) && /\b(ad\s*)?spend\b/i.test(lower)) return true;
+  return false;
+}
+
+function tryResolveExplicitCalendarMonthWindows(lower, rows, dateCol, latestPeriod, previousPeriod, warnings) {
+  if (!rows.length || !dateCol) return null;
+  if (/\b(this|last|next)\s+month\b/i.test(lower)) return null;
+
+  const bt = betweenTwoMonthsMatch(lower);
+  const vs = versusTwoMonthsMatch(lower);
+  let moFirst;
+  let moSecond;
+  if (bt) {
+    moFirst = bt.mo1;
+    moSecond = bt.mo2;
+  } else if (vs) {
+    moFirst = vs.mo1;
+    moSecond = vs.mo2;
+  }
+
+  const hits = collectExplicitCalendarMonthHits(lower);
+  const isoYm = !bt && !vs ? parseIsoYearMonthToken(lower) : null;
+  const isoHit =
+    isoYm && hasRowsInMonthYear(rows, dateCol, isoYm.y, isoYm.mo)
+      ? { mo: isoYm.mo, year: isoYm.y, pos: lower.search(/\b20\d{2}[-/]/) }
+      : null;
+
+  if (!bt && !vs && hits.length === 0 && !isoHit) return null;
+
+  if (bt || vs) {
+    if (moFirst === moSecond) return null;
+    const yShared = latestYearWithBothMonths(rows, dateCol, moFirst, moSecond);
+    if (yShared !== null) {
+      const a = explicitMonthWindow(yShared, Math.min(moFirst, moSecond));
+      const b = explicitMonthWindow(yShared, Math.max(moFirst, moSecond));
+      warnings.push(
+        `Compared **${a.label}** to **${b.label}** (latest calendar year in the file that contains both months).`
+      );
+      return {
+        resolvedTimeRange: b,
+        comparison: a,
+        latestPeriod,
+        previousPeriod,
+        warnings: [...warnings],
+      };
+    }
+    const y1 = yearsHavingMonth(rows, dateCol, moFirst);
+    const y2 = yearsHavingMonth(rows, dateCol, moSecond);
+    const yA = y1.length ? Math.max(...y1) : null;
+    const yB = y2.length ? Math.max(...y2) : null;
+    if (yA === null || yB === null) return null;
+    warnings.push("The two months appear in different years in this file; each window uses the latest year available for that month.");
+    const wA = explicitMonthWindow(yA, moFirst);
+    const wB = explicitMonthWindow(yB, moSecond);
+    const [earlier, later] =
+      yA * 100 + moFirst < yB * 100 + moSecond
+        ? [wA, wB]
+        : yA * 100 + moFirst > yB * 100 + moSecond
+          ? [wB, wA]
+          : moFirst <= moSecond
+            ? [wA, wB]
+            : [wB, wA];
+    return {
+      resolvedTimeRange: later,
+      comparison: earlier,
+      latestPeriod,
+      previousPeriod,
+      warnings: [...warnings],
+    };
+  }
+
+  if (hits.length >= 2) {
+    const h1 = hits[0];
+    const h2 = hits[1];
+    let y1 = h1.year;
+    let y2 = h2.year;
+    if (y1 === null) {
+      const ys = yearsHavingMonth(rows, dateCol, h1.mo);
+      y1 = ys.length ? Math.max(...ys) : null;
+    }
+    if (y2 === null) {
+      const ys = yearsHavingMonth(rows, dateCol, h2.mo);
+      y2 = ys.length ? Math.max(...ys) : null;
+    }
+    if (y1 === null || y2 === null) return null;
+    if (h1.year === null && h2.year === null && y1 === y2) {
+      const y = latestYearWithBothMonths(rows, dateCol, h1.mo, h2.mo);
+      if (y !== null) {
+        y1 = y;
+        y2 = y;
+        warnings.push(`Used calendar year **${y}** for both named months (latest year in the file containing each).`);
+      }
+    }
+    const w1 = explicitMonthWindow(y1, h1.mo);
+    const w2 = explicitMonthWindow(y2, h2.mo);
+    const [earlier, later] =
+      y1 * 100 + h1.mo < y2 * 100 + h2.mo
+        ? [w1, w2]
+        : y1 * 100 + h1.mo > y2 * 100 + h2.mo
+          ? [w2, w1]
+          : h1.pos <= h2.pos
+            ? [w1, w2]
+            : [w2, w1];
+    return {
+      resolvedTimeRange: later,
+      comparison: earlier,
+      latestPeriod,
+      previousPeriod,
+      warnings: [...warnings],
+    };
+  }
+
+  const singleNamed =
+    !bt && !vs && hits.length === 1 ? hits[0] : !bt && !vs && hits.length === 0 && isoHit ? isoHit : null;
+
+  if (singleNamed) {
+    const h = singleNamed;
+    let y = h.year;
+    if (y === null) {
+      const ys = yearsHavingMonth(rows, dateCol, h.mo);
+      y = ys.length ? Math.max(...ys) : null;
+    }
+    if (y === null || !hasRowsInMonthYear(rows, dateCol, y, h.mo)) return null;
+    if (isoHit && h === isoHit) {
+      warnings.push(`Used calendar month **${explicitMonthWindow(y, h.mo).label}** from the **YYYY-MM** / **YYYY/MM** token in your question.`);
+    } else if (h.year === null) {
+      warnings.push(
+        `Interpreted **${explicitMonthWindow(y, h.mo).label}** as the latest calendar year in the file containing that month.`
+      );
+    }
+    const cur = explicitMonthWindow(y, h.mo);
+    if (wantsSingleNamedMonthPriorWindow(lower)) {
+      const prevM = previousCalendarMonth(y, h.mo);
+      if (hasRowsInMonthYear(rows, dateCol, prevM.y, prevM.mo)) {
+        const comparison = explicitMonthWindow(prevM.y, prevM.mo);
+        warnings.push(`For this question, compared **${comparison.label}** (earlier) to **${cur.label}** (later).`);
+        return {
+          resolvedTimeRange: cur,
+          comparison,
+          latestPeriod,
+          previousPeriod,
+          warnings: [...warnings],
+        };
+      }
+      warnings.push(
+        `The month before **${cur.label}** has no rows in the date column, so only **${cur.label}** is scoped (no prior-month comparison).`
+      );
+    }
+    return {
+      resolvedTimeRange: cur,
+      comparison: null,
+      latestPeriod,
+      previousPeriod,
+      warnings: [...warnings],
+    };
+  }
+
+  return null;
+}
+
 /**
  * Resolve primary time comparison windows from the question.
  * Rules:
@@ -668,6 +1037,16 @@ function resolveComparisonWindows(question, rows, dateCol, intent = {}) {
   const latestPeriod = periods[periods.length - 1];
   const previousPeriod = periods.length >= 2 ? periods[periods.length - 2] : null;
 
+  const explicitCalendar = tryResolveExplicitCalendarMonthWindows(
+    lower,
+    rows,
+    dateCol,
+    latestPeriod,
+    previousPeriod,
+    warnings
+  );
+  if (explicitCalendar) return explicitCalendar;
+
   const wantsWeek =
     /\b(this week|last week|previous week|prior week|week over week|wow)\b/i.test(lower);
   const grainInfo = inferDatasetTemporalGranularity(rows, dateCol);
@@ -697,8 +1076,14 @@ function resolveComparisonWindows(question, rows, dateCol, intent = {}) {
     /\b(drop|drops|dropped|decrease|decreas|increase|increas|rose|fall|falls|fell|grew|grow|change|changed|declin|higher|lower)\b/i.test(
       lower
     );
+  /** Any parsed WHY / driver intent with ≥2 dataset months → always compare latest vs previous (before LLM). */
+  const intentWhyNeedsPairWindows =
+    (intent?.wantsWhy || intent?.tasks?.includes("driver_analysis")) && Boolean(previousPeriod);
 
-  if ((wantsThisMonth || wantsLastMonth || wantsMoM || wantsWhyChange) && !previousPeriod) {
+  if (
+    (wantsThisMonth || wantsLastMonth || wantsMoM || wantsWhyChange || intentWhyNeedsPairWindows) &&
+    !previousPeriod
+  ) {
     return {
       resolvedTimeRange: attachDatasetMonthWindow(
         {
@@ -715,7 +1100,12 @@ function resolveComparisonWindows(question, rows, dateCol, intent = {}) {
     };
   }
 
-  if (wantsMoM || wantsWhyChange || (wantsThisMonth && wantsLastMonth)) {
+  if (wantsMoM || wantsWhyChange || intentWhyNeedsPairWindows || (wantsThisMonth && wantsLastMonth)) {
+    if (intentWhyNeedsPairWindows && !wantsWhyChange) {
+      warnings.push(
+        "Why-style question: using **latest month vs previous month** in your file for period-over-period context."
+      );
+    }
     return {
       resolvedTimeRange: attachDatasetMonthWindow(
         {

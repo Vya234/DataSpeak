@@ -1,6 +1,8 @@
 const Groq = require("groq-sdk");
 const { safeJsonParse } = require("../utils/safeJson");
 const { inferColumnsFromRows } = require("../utils/datasetAnalysis");
+const { buildGroqSystemPrompt, buildGroqUserContentPrefix } = require("../lib/promptBuilder");
+const { buildMetricDefinitionsForColumns } = require("../lib/metricDictionary");
 
 /** Stable Groq chat model — verify on console.groq.com if this id changes */
 const GROQ_CHAT_MODEL = "llama-3.1-8b-instant";
@@ -39,11 +41,6 @@ function titleCase(value) {
     .filter(Boolean)
     .map((part) => part.charAt(0).toUpperCase() + part.slice(1))
     .join(" ");
-}
-
-function userWantsChart(question) {
-  const q = normalizeQuestion(question);
-  return /\b(chart|plot|graph|visualize|visualise)\b/i.test(q);
 }
 
 function isComparisonQuestion(question) {
@@ -181,7 +178,7 @@ function getMetricColumnCandidates() {
     Revenue: ["revenue", "sales", "sale", "gross sales", "net sales", "income"],
     Orders: ["orders", "order count", "order", "transactions", "transaction count", "units sold", "units"],
     Signups: ["signups", "sign ups", "signup", "registrations", "registration", "new users", "users"],
-    Complaints: ["complaints", "complaint", "tickets", "support tickets", "issues"],
+    Customers: ["customers", "customer", "customer count", "num customers", "n customers"],
     AdSpend: ["adspend", "ad spend", "spend", "marketing spend", "cost", "costs", "expense", "expenses", "budget"],
     ReturnRate: ["returnrate", "return rate", "returns", "refund rate"],
     ChurnRate: ["churnrate", "churn rate", "churn"],
@@ -267,7 +264,8 @@ function getRequestedMetric(question, columns, resolvedMetrics) {
     { aliases: ["revenue", "sales", "sale"], metric: "Revenue" },
     { aliases: ["orders", "order"], metric: "Orders" },
     { aliases: ["signups", "signup", "registrations"], metric: "Signups" },
-    { aliases: ["complaints", "complaint", "tickets"], metric: "Complaints" },
+    { aliases: ["customers", "customer"], metric: "Customers" },
+    { aliases: ["complaints", "complaint", "tickets", "support tickets"], metric: "Customers" },
     { aliases: ["adspend", "ad spend", "marketing spend", "spend", "cost", "costs", "expense", "expenses", "budget"], metric: "AdSpend" },
     { aliases: ["return rate", "returns", "returnrate"], metric: "ReturnRate" },
     { aliases: ["churn", "churn rate", "churnrate"], metric: "ChurnRate" },
@@ -349,63 +347,41 @@ function getMetricValueFromRow(row, logicalMetric, metricMap) {
   return row[col];
 }
 
+const AVG_METRICS = new Set(["ReturnRate", "ChurnRate", "AvgHandleTimeSec"]);
+
 function aggregateRows(rows, metricMap) {
+  const ids = Object.keys(metricMap || {}).filter((id) => metricMap[id]);
+  const empty = { ARPO: 0 };
+  for (const id of ids) {
+    empty[id] = AVG_METRICS.has(id) ? 0 : 0;
+  }
   if (!Array.isArray(rows) || rows.length === 0) {
-    return {
-      Revenue: 0,
-      Orders: 0,
-      Signups: 0,
-      Complaints: 0,
-      AdSpend: 0,
-      ReturnRate: 0,
-      ChurnRate: 0,
-      AvgHandleTimeSec: 0,
-      ARPO: 0,
-    };
+    return empty;
   }
 
-  const revenue = round(
-    rows.reduce((s, r) => s + toNumber(getMetricValueFromRow(r, "Revenue", metricMap)), 0),
-    2
-  );
-  const orders = round(
-    rows.reduce((s, r) => s + toNumber(getMetricValueFromRow(r, "Orders", metricMap)), 0),
-    0
-  );
-
-  return {
-    Revenue: revenue,
-    Orders: orders,
-    Signups: round(
-      rows.reduce((s, r) => s + toNumber(getMetricValueFromRow(r, "Signups", metricMap)), 0),
-      0
-    ),
-    Complaints: round(
-      rows.reduce((s, r) => s + toNumber(getMetricValueFromRow(r, "Complaints", metricMap)), 0),
-      0
-    ),
-    AdSpend: round(
-      rows.reduce((s, r) => s + toNumber(getMetricValueFromRow(r, "AdSpend", metricMap)), 0),
-      2
-    ),
-    ReturnRate: average(
+  const out = { ...empty };
+  for (const id of ids) {
+    if (AVG_METRICS.has(id)) continue;
+    const dec = id === "Revenue" || id === "AdSpend" || id === "Profit" ? 2 : 0;
+    out[id] = round(
+      rows.reduce((s, r) => s + toNumber(getMetricValueFromRow(r, id, metricMap)), 0),
+      dec
+    );
+  }
+  for (const id of ids) {
+    if (!AVG_METRICS.has(id)) continue;
+    out[id] = average(
       rows
-        .map((r) => getMetricValueFromRow(r, "ReturnRate", metricMap))
-        .filter((v) => v !== undefined && v !== null && v !== "")
-    ),
-    ChurnRate: average(
-      rows
-        .map((r) => getMetricValueFromRow(r, "ChurnRate", metricMap))
-        .filter((v) => v !== undefined && v !== null && v !== "")
-    ),
-    AvgHandleTimeSec: average(
-      rows
-        .map((r) => getMetricValueFromRow(r, "AvgHandleTimeSec", metricMap))
+        .map((r) => getMetricValueFromRow(r, id, metricMap))
         .filter((v) => v !== undefined && v !== null && v !== ""),
-      2
-    ),
-    ARPO: orders === 0 ? 0 : round(revenue / orders, 2),
-  };
+      id === "AvgHandleTimeSec" ? 2 : 4
+    );
+  }
+
+  const revenue = toNumber(out.Revenue);
+  const orders = toNumber(out.Orders);
+  out.ARPO = orders === 0 ? 0 : round(revenue / orders, 2);
+  return out;
 }
 
 function aggregateByTime(rows, timeType, timeCols, metricMap) {
@@ -448,12 +424,13 @@ function aggregateByDimension(rows, dimensionColumn, metricMap) {
     grouped[key].push(row);
   }
 
+  const sortKey = metricMap.Revenue ? "Revenue" : sumMetricIds(metricMap)[0];
   return Object.entries(grouped)
     .map(([label, groupRows]) => ({
       label,
       ...aggregateRows(groupRows, metricMap),
     }))
-    .sort((a, b) => b.Revenue - a.Revenue);
+    .sort((a, b) => toNumber(b[sortKey]) - toNumber(a[sortKey]));
 }
 
 function detectTimeIntent(question) {
@@ -505,6 +482,63 @@ function buildTwoPeriodMetricComparison(metricName, currentValue, previousValue)
     diff,
     pct,
   };
+}
+
+function sumMetricIds(metricMap) {
+  return Object.keys(metricMap || {}).filter((id) => metricMap[id] && !AVG_METRICS.has(id));
+}
+
+function buildSnapshotMetricClause(current, metricMap) {
+  const sums = sumMetricIds(metricMap);
+  if (!sums.length) return "";
+  const parts = sums.map((id) => {
+    const lbl = physicalColumnName(id, metricMap);
+    return `${lbl} is ${formatMetricValue(id, current[id])}`;
+  });
+  const avgs = Object.keys(metricMap || {}).filter((id) => AVG_METRICS.has(id) && metricMap[id]);
+  for (const id of avgs) {
+    const lbl = physicalColumnName(id, metricMap);
+    parts.push(`${lbl} is ${formatMetricValue(id, current[id])}`);
+  }
+  if (parts.length === 1) return parts[0];
+  if (parts.length === 2) return `${parts[0]} and ${parts[1]}`;
+  return `${parts.slice(0, -1).join(", ")}, and ${parts[parts.length - 1]}`;
+}
+
+function buildMultiMetricPeriodNarrative(previous, current, metricMap, leadMetric) {
+  const lead = leadMetric && metricMap[leadMetric] ? leadMetric : sumMetricIds(metricMap)[0];
+  if (!lead) return "";
+
+  const leadCmp = buildTwoPeriodMetricComparison(lead, toNumber(current[lead]), toNumber(previous[lead]));
+  const leadLabel = physicalColumnName(lead, metricMap);
+  let answer =
+    `Comparing ${current.period} to ${previous.period}, ${leadLabel} ` +
+    `${leadCmp.diff >= 0 ? "increased" : "decreased"} by ${Math.abs(leadCmp.pct)}% ` +
+    (lead === "Revenue" || lead === "AdSpend" || lead === "Profit"
+      ? `(${formatSignedCurrencyDiff(leadCmp.diff)}), from ${formatMetricValue(lead, previous[lead])} to ${formatMetricValue(lead, current[lead])}. `
+      : `(${formatSignedNumberDiff(leadCmp.diff)}), from ${formatMetricValue(lead, previous[lead])} to ${formatMetricValue(lead, current[lead])}. `);
+
+  const rest = sumMetricIds(metricMap).filter((id) => id !== lead);
+  const moveParts = [];
+  for (const id of rest) {
+    const cmp = buildTwoPeriodMetricComparison(id, toNumber(current[id]), toNumber(previous[id]));
+    if (cmp.diff === 0 && cmp.pct === 0) continue;
+    const lbl = physicalColumnName(id, metricMap);
+    moveParts.push(
+      `${lbl} ${cmp.diff >= 0 ? "increased" : "decreased"} by ${Math.abs(cmp.pct)}% (${formatSignedNumberDiff(cmp.diff)})`
+    );
+  }
+  if (moveParts.length) answer += moveParts.join(", ") + ". ";
+
+  const avgParts = [];
+  for (const id of Object.keys(metricMap || {})) {
+    if (!AVG_METRICS.has(id) || !metricMap[id]) continue;
+    avgParts.push(
+      `${physicalColumnName(id, metricMap)} moved from ${formatMetricValue(id, previous[id])} to ${formatMetricValue(id, current[id])}`
+    );
+  }
+  if (avgParts.length) answer += avgParts.join(", ") + ".";
+  return answer.trim();
 }
 
 function chooseChartMetric(question, metricMap, columns) {
@@ -683,6 +717,12 @@ function buildFairMonthComparison(rows, timeCols, metricMap) {
   };
 }
 
+/** CSV header for a logical metric slot (never show logical id as the column name to users). */
+function physicalColumnName(metric, metricMap) {
+  const c = metricMap?.[metric];
+  return c || metric;
+}
+
 function formatMetricValue(metric, value) {
   const n = toNumber(value);
 
@@ -715,32 +755,14 @@ function answerWeeklyOrMonthlyComparison(question, rows, timeCols, metricMap, co
     const previous = fair.previousPeriod;
     const current = fair.currentPeriod;
 
-    const revenueCmp = buildTwoPeriodMetricComparison("Revenue", current.Revenue, previous.Revenue);
-    const ordersCmp = buildTwoPeriodMetricComparison("Orders", current.Orders, previous.Orders);
-    const signupsCmp = buildTwoPeriodMetricComparison("Signups", current.Signups, previous.Signups);
-    const complaintsCmp = buildTwoPeriodMetricComparison("Complaints", current.Complaints, previous.Complaints);
-    const adSpendCmp = buildTwoPeriodMetricComparison("AdSpend", current.AdSpend, previous.AdSpend);
-
-    let answer =
-      `Comparing ${current.period} to ${previous.period}, revenue ` +
-      `${revenueCmp.diff >= 0 ? "increased" : "decreased"} by ${Math.abs(revenueCmp.pct)}% ` +
-      `(${formatSignedCurrencyDiff(revenueCmp.diff)}), from ${formatMetricValue("Revenue", previous.Revenue)} to ${formatMetricValue("Revenue", current.Revenue)}. ` +
-      `Orders ${ordersCmp.diff >= 0 ? "increased" : "decreased"} by ${Math.abs(ordersCmp.pct)}% ` +
-      `(${formatSignedNumberDiff(ordersCmp.diff)}), Signups ${signupsCmp.diff >= 0 ? "increased" : "decreased"} by ${Math.abs(signupsCmp.pct)}%, ` +
-      `Complaints ${complaintsCmp.diff >= 0 ? "increased" : "decreased"} by ${Math.abs(complaintsCmp.pct)}%, and ` +
-      `AdSpend ${adSpendCmp.diff >= 0 ? "increased" : "decreased"} by ${Math.abs(adSpendCmp.pct)}%. ` +
-      `ReturnRate moved from ${previous.ReturnRate} to ${current.ReturnRate}, ` +
-      `ChurnRate moved from ${previous.ChurnRate} to ${current.ChurnRate}, and ` +
-      `AvgHandleTimeSec changed from ${previous.AvgHandleTimeSec} to ${current.AvgHandleTimeSec} seconds.`;
+    let answer = buildMultiMetricPeriodNarrative(previous, current, metricMap, chooseChartMetric(question, metricMap, columns));
 
     if (fair.note) answer = `${fair.note} ${answer}`;
 
     return {
       answer,
       source: SOURCE_AI,
-      chartData: userWantsChart(question) || isComparisonQuestion(question)
-        ? buildChartDataForTwoPeriods(question, previous, current, metricMap, columns)
-        : undefined,
+      chartData: buildChartDataForTwoPeriods(question, previous, current, metricMap, columns),
     };
   }
 
@@ -751,32 +773,14 @@ function answerWeeklyOrMonthlyComparison(question, rows, timeCols, metricMap, co
     const previous = fair.previousPeriod;
     const current = fair.currentPeriod;
 
-    const revenueCmp = buildTwoPeriodMetricComparison("Revenue", current.Revenue, previous.Revenue);
-    const ordersCmp = buildTwoPeriodMetricComparison("Orders", current.Orders, previous.Orders);
-    const signupsCmp = buildTwoPeriodMetricComparison("Signups", current.Signups, previous.Signups);
-    const complaintsCmp = buildTwoPeriodMetricComparison("Complaints", current.Complaints, previous.Complaints);
-    const adSpendCmp = buildTwoPeriodMetricComparison("AdSpend", current.AdSpend, previous.AdSpend);
-
-    let answer =
-      `Comparing ${current.period} to ${previous.period}, revenue ` +
-      `${revenueCmp.diff >= 0 ? "increased" : "decreased"} by ${Math.abs(revenueCmp.pct)}% ` +
-      `(${formatSignedCurrencyDiff(revenueCmp.diff)}), from ${formatMetricValue("Revenue", previous.Revenue)} to ${formatMetricValue("Revenue", current.Revenue)}. ` +
-      `Orders ${ordersCmp.diff >= 0 ? "increased" : "decreased"} by ${Math.abs(ordersCmp.pct)}% ` +
-      `(${formatSignedNumberDiff(ordersCmp.diff)}), Signups ${signupsCmp.diff >= 0 ? "increased" : "decreased"} by ${Math.abs(signupsCmp.pct)}%, ` +
-      `Complaints ${complaintsCmp.diff >= 0 ? "increased" : "decreased"} by ${Math.abs(complaintsCmp.pct)}%, and ` +
-      `AdSpend ${adSpendCmp.diff >= 0 ? "increased" : "decreased"} by ${Math.abs(adSpendCmp.pct)}%. ` +
-      `ReturnRate moved from ${previous.ReturnRate} to ${current.ReturnRate}, ` +
-      `ChurnRate moved from ${previous.ChurnRate} to ${current.ChurnRate}, and ` +
-      `AvgHandleTimeSec changed from ${previous.AvgHandleTimeSec} to ${current.AvgHandleTimeSec} seconds.`;
+    let answer = buildMultiMetricPeriodNarrative(previous, current, metricMap, chooseChartMetric(question, metricMap, columns));
 
     if (fair.note) answer = `${fair.note} ${answer}`;
 
     return {
       answer,
       source: SOURCE_AI,
-      chartData: userWantsChart(question) || isComparisonQuestion(question)
-        ? buildChartDataForTwoPeriods(question, previous, current, metricMap, columns)
-        : undefined,
+      chartData: buildChartDataForTwoPeriods(question, previous, current, metricMap, columns),
     };
   }
 
@@ -803,17 +807,16 @@ function answerRateDecreaseQuestion(question, rows, timeCols, metricMap, columns
     const pct = percentChange(currVal, prevVal, 1);
     const direction = pct >= 0 ? "increased" : "decreased";
 
+    const colLabel = physicalColumnName(metric, metricMap);
     let answer =
-      `${metric} ${direction} by ${Math.abs(pct)}% from ${previous.period} to ${current.period}, moving from ${formatMetricValue(metric, prevVal)} to ${formatMetricValue(metric, currVal)}.`;
+      `Column **${colLabel}** ${direction} by ${Math.abs(pct)}% from ${previous.period} to ${current.period}, moving from ${formatMetricValue(metric, prevVal)} to ${formatMetricValue(metric, currVal)}.`;
 
     if (fair.note) answer = `${fair.note} ${answer}`;
 
     return {
       answer,
       source: SOURCE_AI,
-      chartData: userWantsChart(question)
-        ? buildChartDataForTwoPeriods(question, previous, current, metricMap, columns)
-        : undefined,
+      chartData: buildChartDataForTwoPeriods(question, previous, current, metricMap, columns),
     };
   }
 
@@ -828,17 +831,16 @@ function answerRateDecreaseQuestion(question, rows, timeCols, metricMap, columns
     const pct = percentChange(currVal, prevVal, 1);
     const direction = pct >= 0 ? "increased" : "decreased";
 
+    const colLabel = physicalColumnName(metric, metricMap);
     let answer =
-      `${metric} ${direction} by ${Math.abs(pct)}% from ${previous.period} to ${current.period}, moving from ${formatMetricValue(metric, prevVal)} to ${formatMetricValue(metric, currVal)}.`;
+      `Column **${colLabel}** ${direction} by ${Math.abs(pct)}% from ${previous.period} to ${current.period}, moving from ${formatMetricValue(metric, prevVal)} to ${formatMetricValue(metric, currVal)}.`;
 
     if (fair.note) answer = `${fair.note} ${answer}`;
 
     return {
       answer,
       source: SOURCE_AI,
-      chartData: userWantsChart(question)
-        ? buildChartDataForTwoPeriods(question, previous, current, metricMap, columns)
-        : undefined,
+      chartData: buildChartDataForTwoPeriods(question, previous, current, metricMap, columns),
     };
   }
 
@@ -853,12 +855,11 @@ function answerRateDecreaseQuestion(question, rows, timeCols, metricMap, columns
   const pct = percentChange(currVal, prevVal, 1);
   const direction = pct >= 0 ? "increased" : "decreased";
 
+  const colLabel = physicalColumnName(metric, metricMap);
   return {
-    answer: `${metric} ${direction} by ${Math.abs(pct)}% from ${previous.period} to ${current.period}, moving from ${formatMetricValue(metric, prevVal)} to ${formatMetricValue(metric, currVal)}.`,
+    answer: `Column **${colLabel}** ${direction} by ${Math.abs(pct)}% from ${previous.period} to ${current.period}, moving from ${formatMetricValue(metric, prevVal)} to ${formatMetricValue(metric, currVal)}.`,
     source: SOURCE_AI,
-    chartData: userWantsChart(question)
-      ? buildChartDataForTwoPeriods(question, previous, current, metricMap, columns)
-      : undefined,
+    chartData: buildChartDataForTwoPeriods(question, previous, current, metricMap, columns),
   };
 }
 
@@ -898,8 +899,9 @@ function answerBreakdown(question, rows, columns, timeCols, metricMap) {
     return `${row.label}: ${formatMetricValue(metric, row[metric])} (${share}%)`;
   });
 
+  const mcol = physicalColumnName(metric, metricMap);
   let answer =
-    `${metric} breakdown by ${chosenDimension}: ${parts.join("; ")}. ` +
+    `**${mcol}** (by **${chosenDimension}**): ${parts.join("; ")}. ` +
     `The largest contributor is ${top.label} with ${formatMetricValue(metric, top[metric])}.`;
 
   if (dimensionRequest.requested && normalizeToken(dimensionRequest.requested) !== normalizeToken(chosenDimension)) {
@@ -917,9 +919,7 @@ function answerBreakdown(question, rows, columns, timeCols, metricMap) {
   return {
     answer,
     source: SOURCE_AI,
-    chartData: userWantsChart(question) || isBreakdownQuestion(question)
-      ? buildChartDataForBreakdown(question, aggregated, metricMap, columns)
-      : undefined,
+    chartData: buildChartDataForBreakdown(question, aggregated, metricMap, columns),
   };
 }
 
@@ -935,12 +935,24 @@ function answerTotalSalesComposition(question, rows, columns, metricMap, timeCol
     .filter(Boolean);
 
   const seen = new Set();
+  let compChart;
   for (const dim of likelyDims) {
     if (seen.has(dim)) continue;
     seen.add(dim);
 
     const grouped = aggregateByDimension(rows, dim, metricMap);
     if (!grouped.length) continue;
+
+    if (!compChart && grouped.length >= 2) {
+      const revCol = physicalColumnName("Revenue", metricMap);
+      compChart = {
+        labels: grouped.slice(0, 10).map((r) => String(r.label)),
+        values: grouped.slice(0, 10).map((r) => toNumber(r.Revenue)),
+        type: "pie",
+        categoryAxisLabel: dim,
+        valueAxisLabel: revCol,
+      };
+    }
 
     const totalRevenue = grouped.reduce((sum, r) => sum + toNumber(r.Revenue), 0);
     const topEntries = grouped.slice(0, 3).map((r) => {
@@ -949,17 +961,17 @@ function answerTotalSalesComposition(question, rows, columns, metricMap, timeCol
     });
 
     if (topEntries.length) {
-      pieces.push(`By ${dim}, the main revenue contributors are ${topEntries.join(", ")}`);
+      pieces.push(`By **${dim}**, the main contributors for **${physicalColumnName("Revenue", metricMap)}** are ${topEntries.join(", ")}`);
     }
   }
 
+  const revCol = physicalColumnName("Revenue", metricMap);
   return {
     answer:
-      `Total sales are represented by Revenue, and they are primarily driven by order volume and average revenue per order. ` +
-      `In this dataset, total Revenue is ${formatMetricValue("Revenue", overall.Revenue)} from ${formatMetricValue("Orders", overall.Orders)} orders, giving an average revenue per order of ${formatMetricValue("ARPO", overall.ARPO)}. ` +
-      `ReturnRate can reduce effective sales, and the mix across available categorical columns also shapes the total. ` +
+      `In this dataset, total **${revCol}** is ${formatMetricValue("Revenue", overall.Revenue)} from **${physicalColumnName("Orders", metricMap)}** ${formatMetricValue("Orders", overall.Orders)} (ARPO ${formatMetricValue("ARPO", overall.ARPO)}). ` +
       `${pieces.length ? pieces.join(". ") + "." : ""}`,
     source: SOURCE_AI,
+    chartData: compChart,
   };
 }
 
@@ -973,11 +985,7 @@ function answerWeeklySummary(question, rows, timeCols, metricMap) {
   const coverage = getWeekCoverageInfo(current, timeCols);
 
   let answer =
-    `For ${current.period}${coverage.isCompleteWeek ? "" : " so far"}, total Revenue is ${formatMetricValue("Revenue", current.Revenue)}, ` +
-    `Orders are ${formatMetricValue("Orders", current.Orders)}, Signups are ${formatMetricValue("Signups", current.Signups)}, ` +
-    `Complaints are ${formatMetricValue("Complaints", current.Complaints)}, and AdSpend is ${formatMetricValue("AdSpend", current.AdSpend)}. ` +
-    `ReturnRate is ${formatMetricValue("ReturnRate", current.ReturnRate)}, ChurnRate is ${formatMetricValue("ChurnRate", current.ChurnRate)}, ` +
-    `and AvgHandleTimeSec is ${formatMetricValue("AvgHandleTimeSec", current.AvgHandleTimeSec)}.`;
+    `For ${current.period}${coverage.isCompleteWeek ? "" : " so far"}, ${buildSnapshotMetricClause(current, metricMap)}.`;
 
   if (!coverage.isCompleteWeek) answer = `This week is incomplete. ${answer}`;
 
@@ -994,13 +1002,11 @@ function answerWeeklySummary(question, rows, timeCols, metricMap) {
   return {
     answer,
     source: SOURCE_AI,
-    chartData: userWantsChart(question)
-      ? {
-          labels: weekly.map((r) => r.period),
-          values: weekly.map((r) => r.Revenue),
-          type: "line",
-        }
-      : undefined,
+    chartData: {
+      labels: weekly.map((r) => r.period),
+      values: weekly.map((r) => r.Revenue),
+      type: "line",
+    },
   };
 }
 
@@ -1014,11 +1020,7 @@ function answerMonthlySummary(question, rows, timeCols, metricMap) {
   const coverage = getMonthCoverageInfo(current, timeCols);
 
   let answer =
-    `For ${current.period}${coverage.isCompleteMonth ? "" : " so far"}, total Revenue is ${formatMetricValue("Revenue", current.Revenue)}, ` +
-    `Orders are ${formatMetricValue("Orders", current.Orders)}, Signups are ${formatMetricValue("Signups", current.Signups)}, ` +
-    `Complaints are ${formatMetricValue("Complaints", current.Complaints)}, and AdSpend is ${formatMetricValue("AdSpend", current.AdSpend)}. ` +
-    `ReturnRate is ${formatMetricValue("ReturnRate", current.ReturnRate)}, ChurnRate is ${formatMetricValue("ChurnRate", current.ChurnRate)}, ` +
-    `and AvgHandleTimeSec is ${formatMetricValue("AvgHandleTimeSec", current.AvgHandleTimeSec)}.`;
+    `For ${current.period}${coverage.isCompleteMonth ? "" : " so far"}, ${buildSnapshotMetricClause(current, metricMap)}.`;
 
   if (!coverage.isCompleteMonth) answer = `This month is incomplete. ${answer}`;
 
@@ -1037,13 +1039,11 @@ function answerMonthlySummary(question, rows, timeCols, metricMap) {
   return {
     answer,
     source: SOURCE_AI,
-    chartData: userWantsChart(question)
-      ? {
-          labels: monthly.map((r) => r.period),
-          values: monthly.map((r) => r.Revenue),
-          type: "line",
-        }
-      : undefined,
+    chartData: {
+      labels: monthly.map((r) => r.period),
+      values: monthly.map((r) => r.Revenue),
+      type: "line",
+    },
   };
 }
 
@@ -1056,12 +1056,7 @@ function answerDailySummary(question, rows, timeCols, metricMap) {
   const current = daily[daily.length - 1];
   const previous = daily.length > 1 ? daily[daily.length - 2] : null;
 
-  let answer =
-    `For ${current.period}, total Revenue is ${formatMetricValue("Revenue", current.Revenue)}, ` +
-    `Orders are ${formatMetricValue("Orders", current.Orders)}, Signups are ${formatMetricValue("Signups", current.Signups)}, ` +
-    `Complaints are ${formatMetricValue("Complaints", current.Complaints)}, and AdSpend is ${formatMetricValue("AdSpend", current.AdSpend)}. ` +
-    `ReturnRate is ${formatMetricValue("ReturnRate", current.ReturnRate)}, ChurnRate is ${formatMetricValue("ChurnRate", current.ChurnRate)}, ` +
-    `and AvgHandleTimeSec is ${formatMetricValue("AvgHandleTimeSec", current.AvgHandleTimeSec)}.`;
+  let answer = `For ${current.period}, ${buildSnapshotMetricClause(current, metricMap)}.`;
 
   if (previous) {
     const revenuePct = percentChange(current.Revenue, previous.Revenue, 1);
@@ -1075,13 +1070,11 @@ function answerDailySummary(question, rows, timeCols, metricMap) {
   return {
     answer,
     source: SOURCE_AI,
-    chartData: userWantsChart(question)
-      ? {
-          labels: daily.slice(-7).map((r) => r.period),
-          values: daily.slice(-7).map((r) => r.Revenue),
-          type: "line",
-        }
-      : undefined,
+    chartData: {
+      labels: daily.slice(-7).map((r) => r.period),
+      values: daily.slice(-7).map((r) => r.Revenue),
+      type: "line",
+    },
   };
 }
 
@@ -1091,38 +1084,40 @@ function buildStructuredUserPrompt({ question, rows, columns, timeCols, metricMa
   const timeIntent = detectTimeIntent(question);
 
   let preparedData = data;
-  let contextNote = "Raw row-level data sample.";
+  let contextNote = "Row-level rows below.";
 
   if (timeIntent) {
     preparedData = aggregateByTime(data, timeIntent, timeCols, metricMap).map(({ _rows, ...rest }) => rest);
-    contextNote = `Aggregated ${timeIntent}-level data. Use this for time-based interpretation.`;
+    contextNote = `Rows aggregated by ${timeIntent} for the time column.`;
   } else {
     const dimReq = getRequestedDimension(question, cols);
     if (dimReq.column) {
       preparedData = aggregateByDimension(data, dimReq.column, metricMap);
-      contextNote = `Aggregated comparison data grouped by ${dimReq.column}.`;
+      contextNote = `Rows aggregated by exact column **${dimReq.column}**.`;
     }
   }
 
   const sample = preparedData.slice(0, 50);
+  const numericExact = Object.entries(metricMap || {})
+    .map(([logical, physical]) => `${logical} → read values from column "${physical}"`)
+    .join("; ");
 
-  return [
-    `Column names: ${cols.length ? cols.join(", ") : "(none inferred)"}`,
-    `Detected time columns: ${Object.values(timeCols || {}).filter(Boolean).join(", ") || "(none)"}`,
-    `Detected metric columns: ${Object.entries(metricMap || {})
-      .map(([k, v]) => `${k}=${v}`)
-      .join(", ") || "(none)"}`,
-    `Data context: ${contextNote}`,
-    "",
-    "Preview data (JSON):",
-    JSON.stringify(sample),
-    "",
-    "Answer strictly based on the provided preview.",
-    "Do not invent causes such as holidays, campaigns, strategy changes, or events unless they are explicitly present in the data.",
-    "Do not contradict the numeric values shown in the preview.",
-    "If a requested column is not present, say so clearly instead of guessing.",
-    `Question: ${question}`,
-  ].join("\n");
+  return (
+    buildGroqUserContentPrefix(cols) +
+    [
+      `Time columns (exact headers): ${Object.values(timeCols || {}).filter(Boolean).join(", ") || "(none)"}.`,
+      numericExact ? `Metric mapping (use physical names in the answer): ${numericExact}` : "",
+      `Context: ${contextNote}`,
+      "",
+      "Data (JSON):",
+      JSON.stringify(sample),
+      "",
+      "Answer using only the data above. Refer to columns by exact CSV header names.",
+      `Question: ${question}`,
+    ]
+      .filter(Boolean)
+      .join("\n")
+  );
 }
 
 function normalizeGroqResponse(raw) {
@@ -1137,12 +1132,11 @@ function normalizeGroqResponse(raw) {
 
     if (chartData && typeof chartData === "object" && chartData !== null) {
       const labels = Array.isArray(chartData.labels) ? chartData.labels.map(String) : [];
-      const values = Array.isArray(chartData.values)
-        ? chartData.values
-            .map((v) => (Number.isFinite(Number(v)) ? Number(v) : null))
-            .filter((v) => v !== null)
-        : [];
-      const type = ["bar", "line", "pie"].includes(chartData.type) ? chartData.type : "bar";
+      const values = Array.isArray(chartData.values) ? chartData.values.map((v) => Number(v)) : [];
+      if (!values.every((n) => Number.isFinite(n))) {
+        return { answer, source: SOURCE_AI };
+      }
+      const type = ["bar", "line", "pie", "doughnut"].includes(chartData.type) ? chartData.type : "bar";
 
       if (labels.length > 0 && values.length === labels.length) {
         return { answer, chartData: { labels, values, type }, source: SOURCE_AI };
@@ -1164,23 +1158,10 @@ async function askGroqNarrative({ question, rows, columns, timeCols, metricMap }
     };
   }
 
+  const cols = getAllColumns(rows, columns);
+  const metricDefinitions = buildMetricDefinitionsForColumns(cols);
   const userContent = buildStructuredUserPrompt({ question, rows, columns, timeCols, metricMap });
-
-  const system = `You are an expert data analyst.
-
-Always respond with ONLY valid JSON in one of these forms:
-{"answer":"string","chartData":null}
-or
-{"answer":"string","chartData":{"labels":[],"values":[],"type":"bar"}}
-
-Rules:
-1. Use only the provided data preview.
-2. Never assume external causes like holidays, campaigns, or strategy changes unless explicitly present in the data.
-3. Do not contradict the provided numeric values.
-4. If a requested grouping or metric column is missing, say so clearly instead of guessing.
-5. Be concise but insightful.
-6. If a chart is useful, include chartData with equal-length labels and numeric values only.
-7. Use "line" for time trends and "bar" for category comparisons.`;
+  const system = buildGroqSystemPrompt({ columns: cols, metricDefinitions });
 
   try {
     const groq = new Groq({ apiKey });
@@ -1294,16 +1275,13 @@ async function askGroqForInsight({ question, rows, columns }) {
       const metric = chooseChartMetric(question, metricMap, cols);
       const topTwo = aggregated.slice(0, 2);
 
+      const mcol = physicalColumnName(metric, metricMap);
       return {
         answer:
-          `Comparing ${topTwo[0].label} and ${topTwo[1].label}, ` +
-          `${topTwo[0].label} has ${metric === "Revenue" || metric === "AdSpend" ? "higher" : "more"} ${metric} ` +
-          `(${formatMetricValue(metric, topTwo[0][metric])}) than ${topTwo[1].label} ` +
-          `(${formatMetricValue(metric, topTwo[1][metric])}).`,
+          `Comparing **${dimensionColumn}** values **${topTwo[0].label}** vs **${topTwo[1].label}** on column **${mcol}**: ` +
+          `${formatMetricValue(metric, topTwo[0][metric])} vs ${formatMetricValue(metric, topTwo[1][metric])}.`,
         source: SOURCE_AI,
-        chartData: userWantsChart(question)
-          ? buildChartDataForBreakdown(question, topTwo, metricMap, cols)
-          : undefined,
+        chartData: buildChartDataForBreakdown(question, topTwo, metricMap, cols),
       };
     }
   }

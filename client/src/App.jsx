@@ -1,8 +1,7 @@
 import { useState, useEffect } from "react";
-import UploadPanel from "./components/UploadPanel.jsx";
-import ChatPanel from "./components/ChatPanel.jsx";
-import InsightChart from "./components/InsightChart.jsx";
-import DatasetPreview from "./components/DatasetPreview.jsx";
+import DatasetPanel from "./components/DatasetPanel.jsx";
+import QueryPanel from "./components/QueryPanel.jsx";
+import VisualizePanel from "./components/VisualizePanel.jsx";
 
 const API_URL = import.meta.env.VITE_API_URL || "http://localhost:5000";
 
@@ -21,8 +20,6 @@ export default function App() {
   const [error, setError] = useState("");
   const [chartData, setChartData] = useState(null);
 
-
-  // Scroll to very top of page on first load
   useEffect(() => {
     document.documentElement.scrollTop = 0;
     document.body.scrollTop = 0;
@@ -93,6 +90,10 @@ export default function App() {
           role: "assistant",
           content: data.answer || "No answer returned.",
           ...(source ? { source } : {}),
+          ...(data.dataUsed ? { dataUsed: data.dataUsed } : {}),
+          ...(Array.isArray(data.suggestedQuestions) && data.suggestedQuestions.length
+            ? { suggestedQuestions: data.suggestedQuestions }
+            : {}),
         },
       ]);
 
@@ -132,63 +133,27 @@ export default function App() {
       </header>
 
       <main className="grid">
-        {/* Panel 1 — Upload */}
         <section className="card">
-          <h2>Dataset</h2>
-          <UploadPanel
+          <DatasetPanel
+            datasetInfo={datasetInfo}
+            loading={loading}
             onUpload={handleUpload}
-            onReset={handleResetUpload}
-            disabled={loading}
-            uploadedFileName={datasetInfo?.originalName ?? null}
+            onResetUpload={handleResetUpload}
           />
-          {datasetInfo ? (
-            <div className="dataset">
-              <div className="row">
-                <span className="label">File</span>
-                <span className="value">{datasetInfo.originalName}</span>
-              </div>
-              <div className="row">
-                <span className="label">Rows</span>
-                <span className="value">{datasetInfo.rowCount.toLocaleString()}</span>
-              </div>
-              <div className="row">
-                <span className="label">Cols</span>
-                <span className="value">{datasetInfo.columns.length}</span>
-              </div>
-              <DatasetPreview
-                columns={datasetInfo.columns}
-                rows={datasetInfo.sampleRows || []}
-                totalRows={datasetInfo.rowCount}
-              />
-            </div>
-          ) : (
-            <p className="subtle" style={{ marginTop: 12 }}>
-              CSV is parsed server-side and held in memory for this session.
-            </p>
-          )}
         </section>
 
-        {/* Panel 2 — Chat */}
         <section className="card">
-          <h2>Ask your data</h2>
-          <ChatPanel
+          <QueryPanel
             messages={messages}
             onAsk={handleAsk}
-            disabled={!canQuery || loading}
+            canQuery={canQuery}
             loading={loading}
+            error={error}
           />
-          {error ? <p className="error">{error}</p> : null}
         </section>
 
-        {/* Panel 3 — Chart */}
         <section className="card">
-          <h2>Visualize</h2>
-          <InsightChart chartData={chartData} title={chartData ? "Result Chart" : null} />
-          {!chartData && (
-            <p className="subtle">
-              Charts appear automatically when a query returns numeric data. Click to expand.
-            </p>
-          )}
+          <VisualizePanel chartData={chartData} />
         </section>
       </main>
 

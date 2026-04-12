@@ -50,15 +50,15 @@ const METRIC_DICTIONARY = [
     preferAggregation: "sum",
   },
   {
-    id: "Complaints",
+    id: "Customers",
     aliases: [
-      "complaints",
-      "complaint",
-      "customer complaints",
-      "customer_complaints",
-      "tickets",
-      "support tickets",
-      "issues",
+      "customers",
+      "customer",
+      "customer count",
+      "num customers",
+      "n customers",
+      "no customers",
+      "number of customers",
     ],
     preferAggregation: "sum",
   },
@@ -158,6 +158,9 @@ function findColumnForAliases(columns, aliases) {
   for (const alias of aliases) {
     const target = normalizeToken(alias);
     const sing = singularize(alias);
+    /** Avoid mapping unrelated columns (e.g. "customers" → "complaints") via short substring hits. */
+    const allowLoose = target.includes(" ") || target.length >= 9;
+    if (!allowLoose) continue;
     const loose =
       indexed.find((c) => c.normalized.includes(target) || target.includes(c.normalized)) ||
       indexed.find((c) => c.singular.includes(sing) || sing.includes(c.singular));
@@ -219,7 +222,8 @@ function resolvePrimaryMetric(question, columns, rows, metricColumns) {
     if (metricColumns.Cost) return "Cost";
     if (metricColumns.AdSpend) return "AdSpend";
   }
-  if (/\bcomplaints\b|\btickets\b/i.test(question) && metricColumns.Complaints) return "Complaints";
+  if (/\bcustomers?\b|\bnum customers\b/i.test(question) && metricColumns.Customers) return "Customers";
+  if (/\bcomplaints\b|\btickets\b|\bsupport tickets\b/i.test(question) && metricColumns.Customers) return "Customers";
   if (/\bnps\b|net promoter/i.test(question) && metricColumns.NPS) return "NPS";
   if (/\bcsat\b|customer satisfaction/i.test(question) && metricColumns.CSAT) return "CSAT";
   if (/\bactive users\b|\bmau\b|\bdau\b/i.test(question) && metricColumns.ActiveUsers) return "ActiveUsers";

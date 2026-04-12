@@ -21,7 +21,7 @@ function DataTable({ columns, rows, numericCols }) {
             <th
               key={col}
               title={col}
-              style={{ textAlign: numericCols.has(col) ? "right" : "left", position: "static" }}
+              style={{ textAlign: numericCols.has(col) ? "right" : "left" }}
             >
               {col}
             </th>

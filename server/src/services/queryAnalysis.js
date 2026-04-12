@@ -1094,11 +1094,7 @@ function checkCompleteness({ timeBundle, question }) {
   return { warnings };
 }
 
-function logDebug(payload) {
-  if (process.env.DATASPEAK_DEBUG === "1" || process.env.DATASPEAK_DEBUG === "true") {
-    console.log("[DataSpeak]", JSON.stringify({ ts: new Date().toISOString(), ...payload }));
-  }
-}
+function logDebug(_payload) {}
 
 /** Latest calendar year present in the time column (uses bucket keys + parseable dates). */
 function latestDataYear(rows, dateCol) {

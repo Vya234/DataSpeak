@@ -124,6 +124,26 @@ describe("timeResolver + driver window", () => {
     expect(bundle.comparison.start).toBeGreaterThan(0);
     expect(bundle.comparison.end).toBeGreaterThanOrEqual(bundle.comparison.start);
   });
+
+  it("explicit named month + why uses prior calendar month as comparison (not dataset-latest only)", () => {
+    const rows = [
+      { order_date: "2024-01-05", revenue: 100 },
+      { order_date: "2024-02-05", revenue: 50 },
+    ];
+    const intent = parseIntent("Why did revenue drop in February?");
+    const bundle = resolveComparisonWindows("Why did revenue drop in February?", rows, "order_date", intent);
+    expect(bundle.comparison).toBeTruthy();
+    expect(bundle.resolvedTimeRange.label).toMatch(/February/i);
+    expect(bundle.comparison.label).toMatch(/January/i);
+    expect(bundle.resolvedTimeRange.start).toBeGreaterThan(bundle.comparison.start);
+  });
+
+  it("parses YYYY-MM as a single explicit calendar month", () => {
+    const rows = [{ order_date: "2024-02-01", revenue: 10 }];
+    const bundle = resolveComparisonWindows("total revenue in 2024-02", rows, "order_date", parseIntent("x"));
+    expect(bundle.resolvedTimeRange?.label).toMatch(/2024|February|Feb/i);
+    expect(bundle.comparison).toBeFalsy();
+  });
 });
 
 describe("groupByTime (year-month buckets)", () => {
@@ -218,10 +238,29 @@ describe("deterministicAnalytics", () => {
     ];
     const columns = ["Region", "revenue"];
     const metrics = resolveMetrics({ question: "Compare revenue across regions", columns, rows });
-    const out = tryGroupedDimensionComparison("Compare revenue across regions", rows, columns, metrics, null);
+    const out = tryGroupedDimensionComparison("Compare revenue across regions", rows, columns, metrics, null, {});
     expect(out).toBeTruthy();
     expect(out.answer).toMatch(/East/);
     expect(out.answer).toMatch(/Region/);
+  });
+
+  it("does not return grouped comparison for WHY / driver questions (avoid totals-only breakdown)", () => {
+    const rows = [
+      { Region: "East", revenue: 100 },
+      { Region: "West", revenue: 60 },
+    ];
+    const columns = ["Region", "revenue"];
+    const metrics = resolveMetrics({ question: "Why compare revenue across regions?", columns, rows });
+    const intent = parseIntent("Why compare revenue across regions?");
+    const out = tryGroupedDimensionComparison(
+      "Why compare revenue across regions?",
+      rows,
+      columns,
+      metrics,
+      null,
+      intent
+    );
+    expect(out).toBeNull();
   });
 
   it("routes monthly analysis through summary logic (latest vs prior period)", () => {

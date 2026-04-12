@@ -3,7 +3,14 @@
  * No LLM arithmetic; outputs structured evidence for optional formatting.
  */
 
-const { parseNumber, groupByTime, detectTemporalColumn, pearsonCorrelation } = require("../utils/datasetAnalysis");
+const {
+  parseNumber,
+  groupByTime,
+  detectTemporalColumn,
+  pearsonCorrelation,
+  getNumericColumns,
+  findPerfectCategoricalCorrelations,
+} = require("../utils/datasetAnalysis");
 const { filterRowsBySortKeyRange, maxSortKeyInRows, sortKeyToYmd, ymdToSortKey } = require("./timeResolver");
 const { extractEntityPair, isRelativeTimeEntityPair } = require("./intentParser");
 const { findColumnForAliases } = require("./metricResolver");
@@ -155,9 +162,20 @@ function formatMoney(n) {
 
 function formatVal(id, n) {
   if (id === "Revenue" || id === "AdSpend" || id === "Cost" || id === "Profit" || id === "ARPO") return formatMoney(n);
+  if (id === "Customers" || id === "Orders" || id === "Signups" || id === "Churn")
+    return `${Math.round(Number(n) || 0).toLocaleString("en-US")}`;
   if (id === "ReturnRate" || id === "ChurnRate" || id === "GrossMarginPct") return `${(Number(n) || 0).toFixed(4)}`;
   if (id === "NPS" || id === "CSAT") return `${(Number(n) || 0).toFixed(2)}`;
   return `${(Number(n) || 0).toLocaleString("en-US")}`;
+}
+
+function sumMetricColumnRows(rows, col) {
+  let s = 0;
+  for (const r of rows || []) {
+    const n = parseNumber(r?.[col]);
+    if (n !== null) s += n;
+  }
+  return s;
 }
 
 function buildRichBase(overrides) {
@@ -208,8 +226,8 @@ function driverTable(curRows, prevRows, dimCol, valueCol, topN = 5) {
 }
 
 function tryCorrelation(question, rows, columns, metrics, intent) {
-  if (intent.wantsWhy || intent.tasks.includes("driver_analysis")) return null;
-  if (!intent.tasks.includes("correlation") && !/\bcorrelat|\brelationship\b|\bassociated\b/i.test(question)) {
+  if (intent?.wantsWhy || intent?.tasks?.includes("driver_analysis")) return null;
+  if (!intent?.tasks?.includes("correlation") && !/\bcorrelat|\brelationship\b|\bassociated\b/i.test(question)) {
     return null;
   }
 
@@ -231,8 +249,8 @@ function tryCorrelation(question, rows, columns, metrics, intent) {
   if (/\b(spend|cost|ad)\b/i.test(lower) && /\b(revenue|sales)\b/i.test(lower)) {
     colX = colMap.AdSpend || colMap.Cost;
     colY = colMap.Revenue;
-  } else if (/\bcomplaints?\b/i.test(lower) && /\b(revenue|sales)\b/i.test(lower)) {
-    colX = colMap.Complaints;
+  } else if (/\bcomplaints?\b|\bcustomers?\b/i.test(lower) && /\b(revenue|sales)\b/i.test(lower)) {
+    colX = colMap.Customers;
     colY = colMap.Revenue;
   }
   if (!colX || !colY) {
@@ -268,7 +286,8 @@ function tryCorrelation(question, rows, columns, metrics, intent) {
   });
 }
 
-function tryEntityCompare(question, rows, columns, metrics, dateCol) {
+function tryEntityCompare(question, rows, columns, metrics, dateCol, intent = {}) {
+  if (intent?.wantsWhy || intent?.tasks?.includes("driver_analysis")) return null;
   if (!/\bvs\.?\b|\bversus\b|\bcompare\b/i.test(question)) return null;
   const pair = extractEntityPair(question);
   if (!pair || isRelativeTimeEntityPair(pair)) return null;
@@ -309,12 +328,15 @@ function tryEntityCompare(question, rows, columns, metrics, dateCol) {
     if (n !== null) vb += n;
   }
 
+  const total = va + vb;
+  const pa = total === 0 ? 0 : ((va / total) * 100).toFixed(1);
+  const pb = total === 0 ? 0 : ((vb / total) * 100).toFixed(1);
+  const lead = va >= vb ? pair.a : pair.b;
+  const diff = Math.abs(va - vb);
   const answer =
     `Comparing **${pair.a}** vs **${pair.b}** on **${mid}** (${col}): ` +
-    `${pair.a} totals **${formatVal(mid, va)}** (${rowsA.length} rows) and ${pair.b} totals **${formatVal(
-      mid,
-      vb
-    )}** (${rowsB.length} rows).`;
+    `**${pair.a}** **${formatVal(mid, va)}** (${pa}% of the pair total), **${pair.b}** **${formatVal(mid, vb)}** (${pb}%). ` +
+    `**${lead}** leads by **${formatVal(mid, diff)}** (${rowsA.length} + ${rowsB.length} rows).`;
 
   return buildRichBase({
     answer,
@@ -332,8 +354,9 @@ function tryEntityCompare(question, rows, columns, metrics, dateCol) {
 /**
  * "Compare revenue across regions" — grouped totals per dimension (not a time trend).
  */
-function tryGroupedDimensionComparison(question, rows, columns, metrics, dateCol) {
+function tryGroupedDimensionComparison(question, rows, columns, metrics, dateCol, intent = {}) {
   const lower = String(question || "").toLowerCase();
+  if (intent?.wantsWhy || intent?.tasks?.includes("driver_analysis")) return null;
   if (!/\b(compare|comparison|versus|across)\b/i.test(lower)) return null;
   if (/\b(this|last|next|prior|previous|current)\s+month\b/i.test(lower) && /\b(vs\.?|versus)\b/i.test(lower)) {
     return null;
@@ -397,8 +420,9 @@ function tryGroupedDimensionComparison(question, rows, columns, metrics, dateCol
 /**
  * "Which region performed better?" — pick best / second from grouped totals (no LLM).
  */
-function tryWhichDimensionBest(question, rows, columns, metrics, dateCol) {
+function tryWhichDimensionBest(question, rows, columns, metrics, dateCol, intent = {}) {
   const lower = question.toLowerCase();
+  if (intent?.wantsWhy || intent?.tasks?.includes("driver_analysis")) return null;
   if (!/\bwhich\b/i.test(lower)) return null;
   if (!/\b(better|best|performed|stronger|leading|won|outperformed)\b/i.test(lower)) return null;
   if (/\bvs\.?\b|\bversus\b/i.test(lower)) return null;
@@ -463,6 +487,25 @@ function tryTimeComparisonAndDriver(ctx) {
 
   const curRows = filterRowsBySortKeyRange(rows, dateCol, cur.start, cur.end);
   if (!cmp) {
+    const ql = String(question || "").toLowerCase();
+    const needsComparisonExplanation =
+      intent?.wantsWhy ||
+      intent?.tasks?.includes("driver_analysis") ||
+      /\b(why|what caused|what drove|reason|reasons|how come)\b/i.test(ql) ||
+      /\bcauses?\b|\bcause\b/i.test(ql);
+    if (needsComparisonExplanation) {
+      const msg =
+        `This question asks **why** something changed, which requires **comparing two time periods** (current vs previous) plus contribution by **region/product** columns. ` +
+        `Only a **single** time window was resolved for **${cur.label}** in **${dateCol}**, so a causal period-over-period answer is not available. ` +
+        `Try **month over month**, **last month vs this month**, or name **two calendar months**.`;
+      return buildRichBase({
+        answer: filterDescription ? `*(Filters: ${filterDescription})*\n\n${msg}` : msg,
+        confidence: "low",
+        reasoning_mode: "safe_refusal",
+        resolvedTimeRange: cur,
+        warnings: [...(timeBundle.warnings || []), "why_query_missing_comparison_window"],
+      });
+    }
     const agg = aggregateMetrics(curRows, metrics.columnMap, metrics.aggregationHints);
     const mid = metrics.primaryMetricId;
     const answer =
@@ -488,10 +531,33 @@ function tryTimeComparisonAndDriver(ctx) {
 
   const aggCur = aggregateMetrics(curRows, metrics.columnMap, metrics.aggregationHints);
   const aggPrev = aggregateMetrics(prevRows, metrics.columnMap, metrics.aggregationHints);
-  const vCur = aggCur[mid] ?? 0;
-  const vPrev = aggPrev[mid] ?? 0;
+  let vCur = aggCur[mid] ?? 0;
+  let vPrev = aggPrev[mid] ?? 0;
+
+  const preferAvg = metrics.aggregationHints?.[mid] === "avg";
+  if (!preferAvg && col) {
+    const rawCur = sumMetricColumnRows(curRows, col);
+    const rawPrev = sumMetricColumnRows(prevRows, col);
+    if (Number.isFinite(rawCur) && Number.isFinite(rawPrev)) {
+      const tol =
+        1e-3 *
+        Math.max(1, Math.abs(vCur), Math.abs(vPrev), Math.abs(rawCur), Math.abs(rawPrev));
+      if (Math.abs(rawCur - vCur) > tol || Math.abs(rawPrev - vPrev) > tol) {
+        vCur = rawCur;
+        vPrev = rawPrev;
+      } else if (
+        vCur !== vPrev &&
+        rawCur !== rawPrev &&
+        Math.sign(vCur - vPrev) !== Math.sign(rawCur - rawPrev)
+      ) {
+        vCur = rawCur;
+        vPrev = rawPrev;
+      }
+    }
+  }
+
   const pct = pctChange(vCur, vPrev);
-  const dir = vCur >= vPrev ? "increased" : "decreased";
+  const dirWord = vCur > vPrev ? "increased" : vCur < vPrev ? "decreased" : null;
   const negligibleMove =
     vCur === vPrev || (pct !== null && Math.abs(pct) < 0.05);
 
@@ -502,7 +568,7 @@ function tryTimeComparisonAndDriver(ctx) {
   let contributors = null;
   let driverNote = "";
 
-  if (intent.wantsWhy || intent.tasks.includes("driver_analysis")) {
+  if (intent?.wantsWhy || intent?.tasks?.includes("driver_analysis")) {
     if (negligibleMove) {
       driverNote =
         " The metric barely moved between these two periods (< 0.05% change), so driver attribution is not meaningful.";
@@ -527,25 +593,35 @@ function tryTimeComparisonAndDriver(ctx) {
 
       contributors = [];
       if (worstOverall?.worst && metricDropped) {
+        const w = worstOverall.worst;
         contributors.push({
           dimension: worstOverall.dim,
-          label: worstOverall.worst.label,
-          delta: worstOverall.worst.delta,
+          label: w.label,
+          delta: w.delta,
           role: "largest_negative_contributor",
         });
+        const totalSwing = vPrev - vCur;
+        const share =
+          totalSwing > 0 ? Math.min(100, Math.round((Math.abs(w.delta) / totalSwing) * 1000) / 10) : null;
         driverNote =
-          ` The largest contributor to the **drop** by **${worstOverall.dim}** was **${worstOverall.worst.label}** ` +
-          `(delta **${formatVal(mid, worstOverall.worst.delta)}** between the two periods).`;
+          ` **${w.label}** (${worstOverall.dim}): **${mid}** went from **${formatVal(mid, w.previous)}** in **${cmp.label}** ` +
+          `to **${formatVal(mid, w.current)}** in **${cur.label}** (delta **${formatVal(mid, w.delta)}**)` +
+          (share !== null ? ` — about **${share}%** of the overall decline between periods.` : ".");
       } else if (bestOverall?.best && metricRose) {
+        const b = bestOverall.best;
         contributors.push({
           dimension: bestOverall.dim,
-          label: bestOverall.best.label,
-          delta: bestOverall.best.delta,
+          label: b.label,
+          delta: b.delta,
           role: "largest_positive_contributor",
         });
+        const totalSwing = vCur - vPrev;
+        const share =
+          totalSwing > 0 ? Math.min(100, Math.round((Math.abs(b.delta) / totalSwing) * 1000) / 10) : null;
         driverNote =
-          ` The largest contributor to the **increase** by **${bestOverall.dim}** was **${bestOverall.best.label}** ` +
-          `(delta **${formatVal(mid, bestOverall.best.delta)}**).`;
+          ` **${b.label}** (${bestOverall.dim}): **${mid}** went from **${formatVal(mid, b.previous)}** in **${cmp.label}** ` +
+          `to **${formatVal(mid, b.current)}** in **${cur.label}** (delta **${formatVal(mid, b.delta)}**)` +
+          (share !== null ? ` — about **${share}%** of the overall increase between periods.` : ".");
       } else {
         driverNote =
           dims.length === 0
@@ -554,14 +630,14 @@ function tryTimeComparisonAndDriver(ctx) {
       }
     }
 
-    // Supporting metrics: mention direction only if column exists and change is non-zero
+    // Supporting metrics: every other numeric column in the CSV (not the primary metric)
     const support = [];
-    for (const id of ["Orders", "AdSpend", "Complaints", "ChurnRate", "ReturnRate"]) {
-      if (!metrics.columnMap[id] || id === mid) continue;
+    for (const [id, phys] of Object.entries(metrics.columnMap || {})) {
+      if (!phys || id === mid) continue;
       const a = aggCur[id] ?? 0;
       const b = aggPrev[id] ?? 0;
       if (a === b) continue;
-      support.push(`${id} moved from **${formatVal(id, b)}** to **${formatVal(id, a)}**`);
+      support.push(`**${phys}** moved from **${formatVal(id, b)}** to **${formatVal(id, a)}**`);
     }
     if (support.length) {
       driverNote += ` Supporting metrics in the same windows: ${support.join("; ")}.`;
@@ -576,27 +652,62 @@ function tryTimeComparisonAndDriver(ctx) {
         : "";
 
   const assumesDrop = /\b(drop|drops|dropped|declin|fall|falls|fell|decrease)\b/i.test(question);
+  const explicitCalendarWindows =
+    cur.mode === "explicit_calendar_month" || cmp?.mode === "explicit_calendar_month";
+  const periodNoun = explicitCalendarWindows
+    ? "those calendar months"
+    : "the periods compared here (from your question and the date column)";
   let clarify = "";
-  if ((intent.wantsWhy || intent.tasks.includes("driver_analysis")) && assumesDrop) {
+  if ((intent?.wantsWhy || intent?.tasks?.includes("driver_analysis")) && assumesDrop) {
+    const seg =
+      filterDescription && /\b(perform|worse|drop|declin|bad|weak)\b/i.test(question)
+        ? `For the filtered slice (**${filterDescription}**), `
+        : "";
     if (vCur > vPrev) {
-      clarify = "There was no drop between the latest two periods in the dataset. ";
+      clarify = `${seg}the data does **not** show a decline — **${mid}** (**${col}**) was **higher** in **${cur.label}** than in **${cmp.label}** (actually **increased**). `;
     } else if (vCur === vPrev) {
-      clarify = "There was no drop — the value was unchanged between the latest two periods. ";
+      clarify = `${seg}**${mid}** (**${col}**) was **unchanged** between **${cmp.label}** and **${cur.label}**. `;
     }
   }
+
+  const changePhrase =
+    dirWord === null
+      ? "**was unchanged**"
+      : `**${dirWord}**` + (pct !== null ? ` by **${Math.abs(pct).toFixed(1)}%**` : "");
 
   let answer =
     (cmp.partialNote ? `${cmp.partialNote} ` : "") +
     clarify +
-    `**${mid}** (${col}) **${dir}**` +
-    (pct !== null ? ` by **${Math.abs(pct).toFixed(1)}%**` : "") +
-    ` from **${formatVal(mid, vPrev)}** in the earlier window (${cmp.label}${prevRows.length ? `, ${prevRows.length} rows` : ""}) ` +
-    `to **${formatVal(mid, vCur)}** in the later window (${cur.label}${curRows.length ? `, ${curRows.length} rows` : ""}).` +
+    `**${mid}** (${col}) ${changePhrase}` +
+    ` from **${formatVal(mid, vPrev)}** in the earlier window (**${cmp.label}**, column **${col}**${prevRows.length ? `, ${prevRows.length} rows` : ""}) ` +
+    `to **${formatVal(mid, vCur)}** in the later window (**${cur.label}**${curRows.length ? `, ${curRows.length} rows` : ""}).` +
     rowHint +
     driverNote;
 
   if (timeBundle.warnings?.length) {
     answer += ` Notes: ${timeBundle.warnings.join(" ")}`;
+  }
+
+  const colRev = metrics.columnMap.Revenue;
+  const colAd = metrics.columnMap.AdSpend;
+  const qLow = String(question || "").toLowerCase();
+  if (
+    colRev &&
+    colAd &&
+    prevRows.length &&
+    curRows.length &&
+    (/\broi\b|\broas\b|return on ad|ad spend efficiency|per\s*\$1\s*ad|cause\b|\bcutting\b.*\bspend\b/i.test(qLow) ||
+      /\bspend\b.*\b(revenue|drop|declin)/i.test(qLow))
+  ) {
+    const rFeb = sumMetricColumnRows(curRows, colRev);
+    const rJan = sumMetricColumnRows(prevRows, colRev);
+    const aFeb = sumMetricColumnRows(curRows, colAd);
+    const aJan = sumMetricColumnRows(prevRows, colAd);
+    if (aFeb > 0 && aJan > 0) {
+      const roiLater = rFeb / aFeb;
+      const roiEarlier = rJan / aJan;
+      answer += ` **Revenue per $1 ad spend** (**${colRev}** ÷ **${colAd}**) was **${roiEarlier.toFixed(2)}×** in **${cmp.label}** and **${roiLater.toFixed(2)}×** in **${cur.label}**.`;
+    }
   }
 
   return buildRichBase({
@@ -615,7 +726,331 @@ function tryTimeComparisonAndDriver(ctx) {
   });
 }
 
+function wantsCrossDimensionBreakdown(question) {
+  const l = String(question || "").toLowerCase();
+  if (!/\band\b/.test(l)) return false;
+  if (/\bcombination|combinations|cross|every\s+combination\b/i.test(l)) return true;
+  return /\bregion\b/.test(l) && /\bproduct\b/.test(l);
+}
+
+function trySuperlativeTimePeriod(ctx) {
+  const { question, rows, columns, metrics, dateCol } = ctx;
+  const lower = question.toLowerCase();
+  const neg = /\b(worst|lowest|least|minimum|poorest|bottom|weakest)\b/i.test(lower);
+  const pos = /\b(best|highest|most|maximum|top|strongest)\b/i.test(lower);
+  if (!neg && !pos) return null;
+  if (!/\b(month|months)\b/i.test(lower)) return null;
+  const monthTok =
+    lower.match(
+      /\b(january|february|march|april|may|june|july|august|september|october|november|december|jan|feb|mar|apr|jun|jul|aug|sep|sept|oct|nov|dec)\b/g
+    ) || [];
+  if (monthTok.length >= 2 && /\b(between|vs\.?|versus)\b/.test(lower)) return null;
+
+  const temporal = dateCol || detectTemporalColumn(columns);
+  const mid = metrics.primaryMetricId;
+  const col = (mid && metrics.columnMap[mid]) || metrics.primaryColumn;
+  if (!temporal || !col || !mid) return null;
+
+  const buckets = groupByTime(rows, temporal, [col], "sum");
+  if (buckets.length < 2) return null;
+
+  let pick = 0;
+  for (let i = 1; i < buckets.length; i++) {
+    const vi = buckets[i][col] || 0;
+    const vb = buckets[pick][col] || 0;
+    if (neg && vi < vb) pick = i;
+    if (pos && vi > vb) pick = i;
+  }
+  const sel = buckets[pick];
+  const prev = pick > 0 ? buckets[pick - 1] : null;
+  const nextB = pick < buckets.length - 1 ? buckets[pick + 1] : null;
+  const lbl = neg ? "worst" : "best";
+  let answer = `**${sel.label}** was the **${lbl}** month on **${col}** (**${mid}**) at **${formatVal(mid, sel[col] || 0)}**`;
+  const seg = [];
+  if (prev) {
+    const p = pctChange(sel[col] || 0, prev[col] || 0);
+    if (p !== null) {
+      seg.push(
+        `**${prev.label}** → **${sel.label}**: **${p >= 0 ? "+" : ""}${p.toFixed(1)}%** (from **${formatVal(
+          mid,
+          prev[col] || 0
+        )}**)`
+      );
+    }
+  }
+  if (nextB) {
+    const p2 = pctChange(nextB[col] || 0, sel[col] || 0);
+    if (p2 !== null) {
+      seg.push(
+        `**${sel.label}** → **${nextB.label}**: **${p2 >= 0 ? "+" : ""}${p2.toFixed(1)}%** (to **${formatVal(
+          mid,
+          nextB[col] || 0
+        )}**)`
+      );
+    }
+  }
+  if (seg.length) answer += `. Period transitions: ${seg.join("; ")}.`;
+
+  return buildRichBase({
+    answer,
+    resolvedMetric: mid,
+    resolvedDimensions: [temporal],
+    chartData: {
+      labels: buckets.map((b) => b.label),
+      values: buckets.map((b) => b[col] || 0),
+      type: "line",
+    },
+    evidence: { buckets },
+  });
+}
+
+function tryFullMonthlyAllMetrics(ctx) {
+  const { question, rows, columns, metrics, dateCol, intent } = ctx;
+  const lower = (intent?.rawQuestion || question || "").toLowerCase();
+  if (!/\bmonth|\bmonthly\b/i.test(lower)) return null;
+  if (
+    !/\b(all|every|full)\s+metrics?\b/i.test(lower) &&
+    !/\bnot\s+just\s+(revenue|orders)\b/i.test(lower) &&
+    !/\bacross\s+all\s+metrics?\b/i.test(lower)
+  ) {
+    return null;
+  }
+  const temporal = dateCol || detectTemporalColumn(columns);
+  const nums = (metrics.numericColumns || []).filter(Boolean);
+  if (!temporal || nums.length === 0) return null;
+
+  const buckets = groupByTime(rows, temporal, nums, "sum");
+  if (buckets.length === 0) return null;
+
+  const header = ["Month", ...nums];
+  const lines = [header.join(" | ")];
+  for (let i = 0; i < buckets.length; i++) {
+    const b = buckets[i];
+    const prev = i > 0 ? buckets[i - 1] : null;
+    const cells = [b.label];
+    for (const n of nums) {
+      const v = b[n] ?? 0;
+      let cell = Number(v).toLocaleString("en-US", { maximumFractionDigits: 2 });
+      if (prev) {
+        const pv = prev[n] ?? 0;
+        const ch = pv === 0 ? null : ((v - pv) / Math.abs(pv)) * 100;
+        cell += ch !== null ? ` (${ch >= 0 ? "+" : ""}${ch.toFixed(1)}% MoM)` : "";
+      }
+      cells.push(cell);
+    }
+    lines.push(cells.join(" | "));
+  }
+  const answer =
+    `Monthly totals for all numeric columns, with MoM % change per column:\n\n` + lines.join("\n");
+
+  return buildRichBase({
+    answer,
+    resolvedMetric: metrics.primaryMetricId,
+    resolvedDimensions: [temporal, ...nums],
+    evidence: { buckets },
+  });
+}
+
+function tryCrossDimensionBreakdown(ctx) {
+  const { question, rows, columns, metrics, dateCol, intent } = ctx;
+  if (intent?.wantsWhy || intent?.tasks?.includes("driver_analysis")) return null;
+  if (!wantsCrossDimensionBreakdown(question)) return null;
+  if (!intent.isBreakdownQuestion && !/\bbreakdown\b|\bcomposition\b|\bshare\b|\brevenue\b/i.test(question)) {
+    return null;
+  }
+
+  const d1 = findColumnForAliases(columns, DIMENSION_ALIASES.Region);
+  const d2 = findColumnForAliases(columns, DIMENSION_ALIASES.Product);
+  if (!d1 || !d2) return null;
+
+  const mid = metrics.primaryMetricId;
+  const vcol = (mid && metrics.columnMap[mid]) || metrics.primaryColumn;
+  if (!mid || !vcol) return null;
+
+  const map = new Map();
+  for (const row of rows) {
+    const a = String(row[d1] ?? "").trim();
+    const b = String(row[d2] ?? "").trim();
+    if (!a || !b) continue;
+    const k = `${a} + ${b}`;
+    const n = parseNumber(row[vcol]);
+    if (n === null) continue;
+    map.set(k, (map.get(k) || 0) + n);
+  }
+  const entries = [...map.entries()].map(([label, sum]) => ({ label, sum }));
+  if (!entries.length) return null;
+  entries.sort((x, y) => y.sum - x.sum);
+  const total = entries.reduce((s, e) => s + e.sum, 0);
+  const parts = entries.map((e) => {
+    const pct = total === 0 ? 0 : ((e.sum / total) * 100).toFixed(1);
+    return `**${e.label}**: **${formatVal(mid, e.sum)}** (${pct}%)`;
+  });
+
+  const answer = `**${mid}** (**${vcol}**) by **${d1}** and **${d2}**: ${parts.join("; ")}.`;
+
+  return buildRichBase({
+    answer,
+    resolvedMetric: mid,
+    resolvedDimensions: [d1, d2],
+    chartData: {
+      labels: entries.map((e) => e.label),
+      values: entries.map((e) => e.sum),
+      type: "bar",
+    },
+    evidence: { entries, total },
+  });
+}
+
+function tryDerivedMetricByGroup(ctx) {
+  const { question, rows, columns, metrics, dateCol } = ctx;
+  const lower = question.toLowerCase();
+  let mode = null;
+  if (/\brevenue\s*per\s*order|revenue-per-order|average order value|\baov\b/i.test(lower)) mode = "rpo";
+  else if (/\borders\s*per\s*customer\b/i.test(lower)) mode = "opc";
+  else if (/\brevenue\s*per\s*customer\b/i.test(lower)) mode = "rpc";
+  else if (
+    /\bper\s+dollar\s+spent|ad\s*spend\s*efficiency|\broi\b|\broas\b|return on ad|revenue\s*\/\s*ad/i.test(lower)
+  ) {
+    mode = "roi";
+  }
+  if (!mode) return null;
+
+  const rev = metrics.columnMap.Revenue;
+  const ord = metrics.columnMap.Orders;
+  const ads = metrics.columnMap.AdSpend;
+  const cust = metrics.columnMap.Customers;
+  if (mode === "rpo" && (!rev || !ord)) return null;
+  if (mode === "opc" && (!ord || !cust)) return null;
+  if (mode === "rpc" && (!rev || !cust)) return null;
+  if (mode === "roi" && (!rev || !ads)) return null;
+
+  const numericSet = new Set(metrics.numericColumns);
+  let dim = resolveDimensionColumn(question, columns, numericSet, dateCol);
+  if (!dim) {
+    const alt = findColumnForAliases(columns, DIMENSION_ALIASES.Region);
+    if (alt) dim = alt;
+  }
+
+  const computeRatio = (subrows) => {
+    if (mode === "opc") {
+      let o = 0;
+      let c = 0;
+      for (const r of subrows) {
+        o += parseNumber(r[ord]) || 0;
+        c += parseNumber(r[cust]) || 0;
+      }
+      return c === 0 ? null : o / c;
+    }
+    let a = 0;
+    let b = 0;
+    for (const r of subrows) {
+      if (mode === "rpo" || mode === "roi") {
+        a += parseNumber(r[rev]) || 0;
+        b += mode === "rpo" ? parseNumber(r[ord]) || 0 : parseNumber(r[ads]) || 0;
+      } else if (mode === "rpc") {
+        a += parseNumber(r[rev]) || 0;
+        b += parseNumber(r[cust]) || 0;
+      }
+    }
+    return b === 0 ? null : a / b;
+  };
+
+  let parts = [];
+  if (dim) {
+    const groups = new Map();
+    for (const row of rows) {
+      const g = String(row[dim] ?? "").trim() || "(blank)";
+      if (!groups.has(g)) groups.set(g, []);
+      groups.get(g).push(row);
+    }
+    for (const [g, sub] of groups) {
+      const ratio = computeRatio(sub);
+      if (ratio === null) continue;
+      if (mode === "rpo") parts.push(`**${g}**: **$${ratio.toFixed(2)} per order**`);
+      else if (mode === "rpc") parts.push(`**${g}**: **$${ratio.toFixed(2)} revenue per customer**`);
+      else if (mode === "opc") parts.push(`**${g}**: **${ratio.toFixed(2)} orders per customer**`);
+      else if (mode === "roi") parts.push(`**${g}**: **${ratio.toFixed(2)}×** revenue per $1 **${ads}**`);
+    }
+  } else {
+    const ratio = computeRatio(rows);
+    if (ratio === null) return null;
+    if (mode === "rpo") parts.push(`**Overall**: **$${ratio.toFixed(2)} per order**`);
+    else if (mode === "roi") parts.push(`**Overall**: **${ratio.toFixed(2)}×** revenue per $1 **${ads}**`);
+    else return null;
+  }
+
+  if (!parts.length) return null;
+  const label =
+    mode === "rpo"
+      ? "Revenue per order"
+      : mode === "rpc"
+        ? "Revenue per customer"
+        : mode === "opc"
+          ? "Orders per customer"
+          : "Revenue / ad spend (ROI-style)";
+  const answer = `${label} by **${dim || "dataset"}**: ${parts.join("; ")}.`;
+
+  return buildRichBase({
+    answer,
+    resolvedMetric: metrics.primaryMetricId,
+    resolvedDimensions: dim ? [dim] : [],
+    evidence: { mode },
+  });
+}
+
+function tryBestTwoDimCombo(ctx) {
+  const { question, rows, columns, metrics, dateCol, intent } = ctx;
+  const lower = question.toLowerCase();
+  if (intent?.wantsWhy || intent?.tasks?.includes("driver_analysis")) return null;
+  if (!/\b(which|what)\b/i.test(lower)) return null;
+  if (!/\b(combination|combo|and)\b/i.test(lower)) return null;
+  if (!/\b(most|highest|best|drives?|leading|top|least|lowest|worst)\b/i.test(lower)) return null;
+
+  const d1 = findColumnForAliases(columns, DIMENSION_ALIASES.Region);
+  const d2 = findColumnForAliases(columns, DIMENSION_ALIASES.Product);
+  if (!d1 || !d2) return null;
+
+  const mid = metrics.primaryMetricId;
+  const vcol = (mid && metrics.columnMap[mid]) || metrics.primaryColumn;
+  if (!mid || !vcol) return null;
+
+  const map = new Map();
+  for (const row of rows) {
+    const a = String(row[d1] ?? "").trim();
+    const b = String(row[d2] ?? "").trim();
+    if (!a || !b) continue;
+    const k = `${a} + ${b}`;
+    const n = parseNumber(row[vcol]);
+    if (n === null) continue;
+    map.set(k, (map.get(k) || 0) + n);
+  }
+  const entries = [...map.entries()].map(([label, sum]) => ({ label, sum }));
+  if (!entries.length) return null;
+
+  const neg = /\b(least|lowest|worst|minimum|bottom)\b/i.test(lower);
+  entries.sort((x, y) => (neg ? x.sum - y.sum : y.sum - x.sum));
+  const top = entries[0];
+  const answer = `Aggregated across all rows, **${top.label}** has the **${neg ? "lowest" : "highest"}** **${mid}** (**${vcol}**) at **${formatVal(
+    mid,
+    top.sum
+  )}** (sum of **${vcol}** per **${d1}**/**${d2}** pair).`;
+
+  return buildRichBase({
+    answer,
+    resolvedMetric: mid,
+    resolvedDimensions: [d1, d2],
+    chartData: {
+      labels: entries.slice(0, 12).map((e) => e.label),
+      values: entries.slice(0, 12).map((e) => e.sum),
+      type: "bar",
+    },
+    evidence: { entries },
+  });
+}
+
 function tryBreakdown(question, rows, columns, metrics, dateCol, intent) {
+  if (intent?.wantsWhy || intent?.tasks?.includes("driver_analysis")) return null;
+  if (wantsCrossDimensionBreakdown(question)) return null;
   if (!intent.isBreakdownQuestion && !/\bbreakdown\b|\bcomposition\b|\bshare\b/i.test(question)) return null;
 
   const qStr = String(question || "");
@@ -727,34 +1162,77 @@ function trySummary(intent, rows, columns, metrics, dateCol) {
 }
 
 function tryAnomaly(intent, rows, columns, metrics, dateCol) {
-  if (!intent.tasks.includes("anomaly")) return null;
+  const lower = (intent?.rawQuestion || "").toLowerCase();
+  const wantsAnomaly = intent?.tasks?.includes("anomaly");
+  const wantsTrend = intent?.tasks?.includes("trend");
+  if (!wantsAnomaly && !wantsTrend) return null;
+
   const temporal = dateCol || detectTemporalColumn(columns);
   const col = metrics.columnMap[metrics.primaryMetricId] || metrics.primaryColumn;
-  if (!temporal || !col) return null;
+  const numericSet = new Set(getNumericColumns(rows, columns));
+  const structural = findPerfectCategoricalCorrelations(rows, columns, numericSet);
+  const structuralNote = structural.length
+    ? structural
+        .map(
+          (p) =>
+            `**${p.colA}** and **${p.colB}** look **perfectly correlated** in this upload (each value of one maps to exactly one value of the other) — they may represent the same business dimension.`
+        )
+        .join(" ")
+    : "";
+
+  if (!temporal || !col) {
+    if (!structuralNote) return null;
+    return buildRichBase({
+      answer: `Structural note: ${structuralNote}`,
+      evidence: { structural },
+    });
+  }
 
   const buckets = groupByTime(rows, temporal, [col], "sum");
-  if (buckets.length < 4) return null;
+  if (buckets.length < 2) {
+    if (!structuralNote) return null;
+    return buildRichBase({
+      answer: `Structural note: ${structuralNote}`,
+      evidence: { structural },
+    });
+  }
+
+  const transitions = [];
+  let allUp = true;
+  let allDown = true;
+  for (let i = 1; i < buckets.length; i++) {
+    const a = buckets[i - 1][col] || 0;
+    const b = buckets[i][col] || 0;
+    const p = pctChange(b, a);
+    if (p === null) continue;
+    transitions.push(`**${buckets[i - 1].label}** → **${buckets[i].label}**: **${p >= 0 ? "+" : ""}${p.toFixed(1)}%**`);
+    if (p <= 0) allUp = false;
+    if (p >= 0) allDown = false;
+  }
+
+  let trendSentence = "";
+  if (transitions.length) {
+    if (allUp) trendSentence = `**${col}** rises every period (${transitions.join("; ")}).`;
+    else if (allDown) trendSentence = `**${col}** falls every period (${transitions.join("; ")}).`;
+    else trendSentence = `Period-to-period **${col}** changes: ${transitions.join("; ")}.`;
+  }
 
   const vals = buckets.map((b) => b[col] || 0);
   const mean = vals.reduce((a, b) => a + b, 0) / vals.length;
   const std = Math.sqrt(vals.reduce((a, v) => a + (v - mean) ** 2, 0) / vals.length) || 1;
   const last = vals[vals.length - 1];
-  const z = (last - mean) / std;
-  if (Math.abs(z) < 2) {
-    return buildRichBase({
-      answer:
-        "No strong anomaly in the latest aggregated period: it is within about **2 standard deviations** of the recent average.",
-      evidence: { z, mean, std, last },
-    });
+  const z = std > 0 ? (last - mean) / std : 0;
+  let tail = "";
+  if (buckets.length >= 4 && Math.abs(z) >= 2) {
+    tail = ` The latest bucket is about **${z.toFixed(2)}** σ from the mean of all buckets in this series.`;
   }
 
-  const direction = z > 0 ? "high" : "low";
+  const answer = [trendSentence, structuralNote, tail].filter(Boolean).join(" ");
+
   return buildRichBase({
-    answer: `The latest period looks unusually **${direction}** for **${col}** (about **${z.toFixed(
-      2
-    )}** standard deviations from the recent average). Verify filters and seasonality before acting.`,
-    warnings: ["Anomaly detection is statistical only, not a root-cause analysis."],
-    evidence: { z, mean, std, last },
+    answer: answer || "Not enough structure to summarize anomalies for this question.",
+    warnings: structural.length ? ["Perfect correlation is a data-shape observation, not causality."] : [],
+    evidence: { z, mean, std, last, structural, transitions },
   });
 }
 
@@ -768,12 +1246,18 @@ function runDeterministicPipeline(ctx, opts = {}) {
 
   return (
     (!opts.skipTimeDriver && tryTimeComparisonAndDriver(ctx)) ||
-    tryGroupedDimensionComparison(ctx.question, rows, columns, metrics, dateCol) ||
+    trySuperlativeTimePeriod(ctx) ||
+    tryFullMonthlyAllMetrics(ctx) ||
+    tryCrossDimensionBreakdown(ctx) ||
+    tryDerivedMetricByGroup(ctx) ||
+    tryBestTwoDimCombo(ctx) ||
+    tryGroupedDimensionComparison(ctx.question, rows, columns, metrics, dateCol, intent) ||
     tryProductMomGrowth(ctx) ||
-    tryWhichDimensionBest(ctx.question, rows, columns, metrics, dateCol) ||
-    tryEntityCompare(ctx.question, rows, columns, metrics, dateCol) ||
+    tryWhichDimensionBest(ctx.question, rows, columns, metrics, dateCol, intent) ||
+    tryEntityCompare(ctx.question, rows, columns, metrics, dateCol, intent) ||
     tryCorrelation(ctx.question, rows, columns, metrics, intent) ||
     trySummary(intent, rows, columns, metrics, dateCol) ||
+    tryAnomaly(intent, rows, columns, metrics, dateCol) ||
     tryBreakdown(ctx.question, rows, columns, metrics, dateCol, intent) ||
     null
   );

@@ -28,8 +28,11 @@ function buildChart(canvas, chartData, type) {
   const colors      = Array.from({ length: n }, (_, i) => PALETTE[i % PALETTE.length]);
   const colorsHover = Array.from({ length: n }, (_, i) => PALETTE_HOVER[i % PALETTE_HOVER.length]);
 
+  const valueAxis = chartData.valueAxisLabel || "Value";
+  const categoryAxis = chartData.categoryAxisLabel || "Category";
+
   const dataset = {
-    label: chartData.title || "Value",
+    label: chartData.title || valueAxis,
     data: chartData.values.map((v) => Number(v)),
 
     backgroundColor:
@@ -76,7 +79,7 @@ function buildChart(canvas, chartData, type) {
       animation: { duration: 500, easing: "easeOutQuart" },
       plugins: {
         legend: {
-          display: type === "pie" || type === "doughnut",
+          display: true,
           position: "bottom",
           labels: {
             color: "#9494aa",
@@ -111,12 +114,24 @@ function buildChart(canvas, chartData, type) {
           ? {}
           : {
               x: {
+                title: {
+                  display: Boolean(categoryAxis),
+                  text: categoryAxis,
+                  color: "#6b6b80",
+                  font: { size: 11, weight: "600" },
+                },
                 ticks: { color: "#4e4e66", maxRotation: 0, autoSkip: true, font: { size: 11 } },
                 grid: { color: "rgba(38,38,60,0.7)", drawBorder: false },
                 border: { color: "transparent" },
               },
               y: {
                 beginAtZero: true,
+                title: {
+                  display: Boolean(valueAxis),
+                  text: valueAxis,
+                  color: "#6b6b80",
+                  font: { size: 11, weight: "600" },
+                },
                 ticks: {
                   color: "#4e4e66",
                   font: { size: 11 },

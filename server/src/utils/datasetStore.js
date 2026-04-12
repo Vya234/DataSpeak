@@ -4,6 +4,8 @@
  */
 const datasetStore = (() => {
   let current = null;
+  /** @type {object|null} Last answer computation metadata (source-transparency). */
+  let lastQueryMeta = null;
 
   return {
     setDataset(dataset) {
@@ -11,6 +13,12 @@ const datasetStore = (() => {
     },
     getDataset() {
       return current;
+    },
+    setLastQueryMeta(meta) {
+      lastQueryMeta = meta && typeof meta === "object" ? { ...meta } : null;
+    },
+    getLastQueryMeta() {
+      return lastQueryMeta;
     },
   };
 })();

@@ -470,9 +470,20 @@ function tryRangeRule(q, data, cols) {
  * Order: topN → bottomN → trend → groupBy → chart → count → total → average → range → highest → lowest.
  * @returns {{ answer: string, source: string, chartData?: object } | null}
  */
+function questionSeeksCausalExplanation(q) {
+  const lower = String(q || "").toLowerCase();
+  return (
+    /\b(why|what caused|what drove|reason|reasons|how come)\b/i.test(lower) ||
+    /\bcauses?\b|\bcause\b/i.test(lower) ||
+    (/\b(why|what|reason|cause|explain)\b/i.test(lower) &&
+      /\b(drop|drops|dropped|increase|increased|decrease|decreased)\b/i.test(lower))
+  );
+}
+
 function tryRuleBasedAnswer({ question, rows, columns }) {
   const q = String(question || "").trim();
   if (!q) return null;
+  if (questionSeeksCausalExplanation(q)) return null;
 
   const data = Array.isArray(rows) ? rows : [];
   const cols = Array.isArray(columns) && columns.length > 0 ? columns : inferColumnsFromRows(data);

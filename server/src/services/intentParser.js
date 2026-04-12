@@ -16,10 +16,15 @@ function parseIntent(question) {
   /** @type {Set<string>} */
   const tasks = new Set();
 
+  /** Causal / explanation-seeking (drives time+contribution path, not plain breakdown). */
   const whyLike =
-    /\b(why|what caused|what drove|reason|reasons|explain|because|due to|driver|drivers|root cause)\b/i.test(
+    /\b(why|what caused|what drove|reason|reasons|explain|because|due to|driver|drivers|root cause|how come)\b/i.test(
       lower
-    );
+    ) ||
+    /\bcauses?\b/i.test(lower) ||
+    /\bcause\b/i.test(lower) ||
+    (/\b(why|what|reason|cause|explain)\b/i.test(lower) &&
+      /\b(drop|drops|dropped|increase|increased|decrease|decreased|declin|rose|fell)\b/i.test(lower));
   const compareTime =
     /\b(last month|this month|next month|last week|this week|next week|today|yesterday|mom|wow|yoy|qoq|dod|month over month|week over week|year over year|quarter over quarter|q[1-4]\b|quarter\b)/i.test(
       lower
@@ -113,6 +118,7 @@ function parseIntent(question) {
 
 /**
  * Pull "A vs B" style entity names from the question (best-effort).
+ * Must keep full labels like "Product A" — do not strip the dimension prefix.
  */
 function extractEntityPair(question) {
   const raw = normalizeQ(question);
@@ -120,15 +126,19 @@ function extractEntityPair(question) {
   const quoted = [...raw.matchAll(/["']([^"']{2,80})["']/g)].map((m) => m[1].trim());
   if (quoted.length >= 2) return { a: quoted[0], b: quoted[1] };
 
-  const vs = raw.split(/\bvs\.?\b|\bversus\b/i);
-  if (vs.length >= 2) {
-    const left = vs[0].replace(/^.*\b(region|product|channel|segment|department|for|in)\s+/i, "").trim();
-    const right = vs[1].replace(/\?.*$/, "").trim();
-    const clean = (s) => s.replace(/^(the|a|an)\s+/i, "").trim();
-    const a = clean(left.split(/[,.;]/)[0] || "");
-    const b = clean(right.split(/[,.;]/)[0] || "");
-    if (a.length >= 2 && b.length >= 2) return { a, b };
-  }
+  const parts = raw.split(/\bvs\.?\b|\bversus\b/i);
+  if (parts.length < 2) return null;
+
+  const clean = (s) => String(s || "").replace(/^(the|a|an)\s+/i, "").trim();
+
+  const leftSeg = parts[parts.length - 2];
+  const rightSeg = parts[parts.length - 1].replace(/\?.*$/, "").trim();
+  const leftCandidates = leftSeg.split(/[.;]/).map((x) => x.trim()).filter(Boolean);
+  const leftPhrase = clean(leftCandidates.length ? leftCandidates[leftCandidates.length - 1] : leftSeg);
+  const b = clean((rightSeg.split(/[,.;]/)[0] || rightSeg).trim());
+  const a = clean(leftPhrase.split(/[,.;]/)[0] || leftPhrase);
+
+  if (a.length >= 2 && b.length >= 2) return { a, b };
   return null;
 }
 
