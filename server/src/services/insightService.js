@@ -3,22 +3,22 @@
  *
  * Routing flow:
  *   1. Validate + normalise dataset
- *   2. *** Extract + apply categorical filters from the question ***
- *   3. Try rule-based engine on the FILTERED dataset
- *   4. If no rule matched → enrich context and send FILTERED data to Groq
- *
- * Filtering happens exactly once, here, so neither the rule engine nor
- * the LLM ever sees rows that don't match the user's intent.
+ *   2. Extract + apply categorical filters from the question
+ *   3. Deterministic analytics pipeline (filtered rows)
+ *   4. Rule-based engine → Groq
  */
 
 const { tryRuleBasedAnswer } = require("./ruleBasedQuery");
 const { askGroqForInsight } = require("./groqService");
+const { runDeterministicPipeline } = require("./deterministicAnalytics");
+const { parseIntent } = require("./intentParser");
+const { resolveMetrics } = require("./metricResolver");
+const { findBestDateColumn, resolveComparisonWindows } = require("./timeResolver");
 const {
   inferColumnsFromRows,
   getNumericColumns,
   groupBy,
   groupByTime,
-  detectTrend,
   summaryStats,
   detectTemporalColumn,
   detectGroupColumn,
@@ -28,8 +28,6 @@ const { filterDataset } = require("../utils/filterDataset");
 
 const LARGE_DATASET_THRESHOLD = 200;
 
-// ─── INTENT HELPERS ───────────────────────────────────────────────────────────
-
 function questionWantsTrend(q) {
   return /\b(trend|over time|progress|growth|decline|change|month.over|year.over|increase|decrease|fluctuat)\b/i.test(q);
 }
@@ -38,37 +36,38 @@ function questionWantsGroupBy(q) {
   return /\b(by |per |each |breakdown|group|segment|categor)\b/i.test(q);
 }
 
-// ─── LARGE-DATASET / TIME-SERIES ENRICHMENT ──────────────────────────────────
+function sanitizeChartData(chartData) {
+  if (!chartData || typeof chartData !== "object") return undefined;
+  const labels = Array.isArray(chartData.labels) ? chartData.labels.map(String) : [];
+  const rawVals = Array.isArray(chartData.values) ? chartData.values : [];
+  if (labels.length === 0 || rawVals.length !== labels.length) return undefined;
+  const values = rawVals.map((v) => Number(v));
+  if (!values.every((n) => Number.isFinite(n))) return undefined;
+  const type = ["bar", "line", "pie"].includes(chartData.type) ? chartData.type : "bar";
+  return { labels, values, type };
+}
 
-/**
- * Builds the optimal payload for Groq:
- *
- * - Time-series query + temporal column present:
- *     → convert to monthly aggregated rows (clean, 8–15 points)
- *     → Groq receives tidy time-series instead of 31 noisy raw rows
- *
- * - Large dataset (>200 rows), non-time-series:
- *     → summary stats + grouped aggregations + representative sample
- *
- * - Small dataset: pass full rows unchanged.
- *
- * Always operates on the already-filtered rows.
- */
+function shapeApiResponse(raw) {
+  const answer = typeof raw?.answer === "string" ? raw.answer : "";
+  const source = raw?.source === "AI" ? "AI" : "rule-based";
+  const chartData = sanitizeChartData(raw?.chartData);
+  const out = { answer, source };
+  if (chartData) out.chartData = chartData;
+  return out;
+}
+
 function buildLLMPayload({ question, rows, columns }) {
   const numericCols = getNumericColumns(rows, columns);
   const temporalCol = detectTemporalColumn(columns);
   const isTrendQuery = questionWantsTrend(question);
 
-  // ── Time-series path ──────────────────────────────────────────────────────
   if (isTrendQuery && temporalCol && numericCols.length > 0) {
     const avgKeywords = /\b(price|rate|ratio|score|rating|index|temperature|avg|average|mean|percent|%)\b/i;
     const agg = avgKeywords.test(question) ? "avg" : "sum";
 
-    // Aggregate ALL numeric cols into monthly buckets — gives Groq clean data
     const timeBuckets = groupByTime(rows, temporalCol, numericCols.slice(0, 5), agg);
 
     if (timeBuckets.length >= 2) {
-      // Convert bucket objects to plain rows Groq can read
       const aggregatedRows = timeBuckets.map((b) => {
         const r = { [temporalCol]: b.label };
         for (const col of numericCols.slice(0, 5)) {
@@ -85,12 +84,10 @@ function buildLLMPayload({ question, rows, columns }) {
     }
   }
 
-  // ── Small dataset: full data ──────────────────────────────────────────────
   if (rows.length <= LARGE_DATASET_THRESHOLD) {
     return { rows, columns };
   }
 
-  // ── Large dataset: stats + grouped + sample ───────────────────────────────
   const categoricalCol = detectGroupColumn(rows, columns, numericCols);
   const stats = summaryStats(rows, columns);
   const groupedResults = [];
@@ -118,17 +115,11 @@ function buildLLMPayload({ question, rows, columns }) {
   };
 }
 
-// ─── MAIN ORCHESTRATOR ────────────────────────────────────────────────────────
-
 /**
- * Hybrid insight: filter → rule-based → Groq.
- * Response always includes `source`.
- *
  * @param {{ question: string, dataset: { rows?: object[], columns?: string[] } }} params
  * @returns {Promise<{ answer: string, source: 'rule-based' | 'AI', chartData?: object }>}
  */
 async function getInsight({ question, dataset }) {
-  // ── 1. Normalise dataset ────────────────────────────────────────────────────
   const allRows = Array.isArray(dataset?.rows) ? dataset.rows : [];
   const columns =
     Array.isArray(dataset?.columns) && dataset.columns.length > 0
@@ -137,7 +128,6 @@ async function getInsight({ question, dataset }) {
 
   const trimmed = String(question || "").trim();
 
-  // ── 2. Extract + apply categorical filters ──────────────────────────────────
   const numericColumns = getNumericColumns(allRows, columns);
   const { filteredRows, filters, filterDescription } = filterDataset({
     question: trimmed,
@@ -146,26 +136,50 @@ async function getInsight({ question, dataset }) {
     numericColumns,
   });
 
-  // If filtering wiped out all rows (bad match), fall back to full dataset
   const rows = filteredRows.length > 0 ? filteredRows : allRows;
   const wasFiltered = filters.length > 0 && filteredRows.length > 0;
 
-  // ── 3. Rule-based engine on filtered data ───────────────────────────────────
+  const intent = parseIntent(trimmed);
+  const metrics = resolveMetrics({ question: trimmed, columns, rows });
+  const numericSet = new Set(getNumericColumns(rows, columns));
+  const { column: resolvedDateCol } = findBestDateColumn(rows, columns, numericSet);
+  const dateCol = resolvedDateCol || detectTemporalColumn(columns);
+  const timeBundle = dateCol ? resolveComparisonWindows(trimmed, rows, dateCol, intent) : {};
+
+  const deterministic = runDeterministicPipeline({
+    question: trimmed,
+    rows,
+    columns,
+    intent,
+    metrics,
+    dateCol,
+    timeBundle,
+    filterDescription: wasFiltered ? filterDescription : "",
+  });
+
+  if (deterministic && typeof deterministic.answer === "string" && deterministic.answer.trim()) {
+    let merged = deterministic;
+    if (wasFiltered && !/\*\([^)]*Filter/i.test(merged.answer)) {
+      merged = {
+        ...merged,
+        answer: `*(Filtered: ${filterDescription} — ${rows.length} of ${allRows.length} rows)*\n\n${merged.answer}`,
+      };
+    }
+    return shapeApiResponse(merged);
+  }
+
   const ruled = tryRuleBasedAnswer({ question: trimmed, rows, columns });
   if (ruled) {
-    // Annotate the answer so the user knows filtering was applied
     if (wasFiltered && ruled.answer) {
       ruled.answer =
         `*(Filtered: ${filterDescription} — ${rows.length} of ${allRows.length} rows)*\n\n` +
         ruled.answer;
     }
-    return ruled;
+    return shapeApiResponse(ruled);
   }
 
-  // ── 4. Groq with enriched, filtered context ─────────────────────────────────
   const payload = buildLLMPayload({ question: trimmed, rows, columns });
 
-  // Inject filter + aggregation context so the LLM is fully aware of what it's seeing
   const filterNote = wasFiltered
     ? `[Dataset pre-filtered: ${filterDescription} — ${rows.length} of ${allRows.length} rows.]`
     : "";
@@ -178,11 +192,12 @@ async function getInsight({ question, dataset }) {
     ? `${trimmed}\n\n${contextNote}`
     : trimmed;
 
-  return askGroqForInsight({
+  const ai = await askGroqForInsight({
     question: questionWithContext,
     rows: payload.rows,
     columns: payload.columns,
   });
+  return shapeApiResponse(ai);
 }
 
 module.exports = { getInsight };
