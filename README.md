@@ -248,7 +248,7 @@ column names.
 
 ---
 
-## Screenshots
+## Dashboard
 
 ![DataSpeak Interface](screenshots/DataSpeak_dashboard.png)
 
