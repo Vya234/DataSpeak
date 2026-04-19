@@ -1,6 +1,15 @@
 const Groq = require("groq-sdk");
 const { safeJsonParse } = require("../utils/safeJson");
-const { inferColumnsFromRows } = require("../utils/datasetAnalysis");
+const {
+  inferColumnsFromRows,
+  parseNumber,
+  getNumericColumns,
+  inferDatasetTemporalGranularity,
+} = require("../utils/datasetAnalysis");
+const {
+  buildUnmatchedQuestionMessage,
+  buildMissingReferencedMetricMessage,
+} = require("../lib/insightFallbackMessages");
 const { buildGroqSystemPrompt, buildGroqUserContentPrefix } = require("../lib/promptBuilder");
 const { buildMetricDefinitionsForColumns } = require("../lib/metricDictionary");
 
@@ -304,7 +313,14 @@ function sortPeriodKeys(keys, timeType) {
   const arr = [...keys];
 
   if (timeType === "date") {
-    return arr.sort((a, b) => new Date(a) - new Date(b));
+    return arr.sort((a, b) => {
+      const da = new Date(a);
+      const db = new Date(b);
+      const ta = da.getTime();
+      const tb = db.getTime();
+      if (Number.isFinite(ta) && Number.isFinite(tb) && ta !== tb) return ta - tb;
+      return String(a).localeCompare(String(b));
+    });
   }
 
   if (timeType === "month") {
@@ -976,20 +992,47 @@ function answerTotalSalesComposition(question, rows, columns, metricMap, timeCol
 }
 
 function answerWeeklySummary(question, rows, timeCols, metricMap) {
-  if (!isWeeklySummaryQuestion(question) || !timeCols.weekCol) return null;
+  if (!isWeeklySummaryQuestion(question)) return null;
 
-  const weekly = aggregateByTime(rows, "week", timeCols, metricMap);
-  if (!weekly.length) return null;
+  let grainNote = "";
+  let weekly;
+  let usedWeekCol = Boolean(timeCols.weekCol);
+
+  if (timeCols.weekCol) {
+    weekly = aggregateByTime(rows, "week", timeCols, metricMap);
+  } else if (timeCols.dateCol) {
+    const inferred = inferDatasetTemporalGranularity(rows, timeCols.dateCol);
+    weekly = aggregateByTime(rows, "date", timeCols, metricMap);
+    if (inferred.grain === "month") {
+      grainNote =
+        "Your data is **monthly** (no week column). Summaries use each distinct **date** value as its own period instead of ISO weeks.\n\n";
+    } else {
+      grainNote =
+        "No dedicated **week** column was found; each distinct **date** in the file is treated as one period (common for weekly exports).\n\n";
+    }
+  } else {
+    return null;
+  }
+
+  if (!weekly.length) {
+    return {
+      answer:
+        grainNote +
+        "Could not build a weekly-style timeline from the available date columns in this upload.",
+      source: SOURCE_AI,
+    };
+  }
 
   const current = weekly[weekly.length - 1];
   const coverage = getWeekCoverageInfo(current, timeCols);
 
   let answer =
-    `For ${current.period}${coverage.isCompleteWeek ? "" : " so far"}, ${buildSnapshotMetricClause(current, metricMap)}.`;
+    grainNote +
+    `For ${String(current.period ?? "")}${coverage.isCompleteWeek ? "" : " so far"}, ${buildSnapshotMetricClause(current, metricMap)}.`;
 
-  if (!coverage.isCompleteWeek) answer = `This week is incomplete. ${answer}`;
+  if (usedWeekCol && !coverage.isCompleteWeek) answer = `This week is incomplete. ${answer}`;
 
-  if (weekly.length > 1) {
+  if (weekly.length > 1 && usedWeekCol) {
     const fair = buildFairWeekComparison(rows, timeCols, metricMap);
     if (fair) {
       const revenuePct = percentChange(fair.currentPeriod.Revenue, fair.previousPeriod.Revenue, 1);
@@ -997,6 +1040,11 @@ function answerWeeklySummary(question, rows, timeCols, metricMap) {
       answer +=
         ` Compared with ${fair.previousPeriod.period}, Revenue ${revenuePct >= 0 ? "increased" : "decreased"} by ${Math.abs(revenuePct)}% and Orders ${ordersPct >= 0 ? "increased" : "decreased"} by ${Math.abs(ordersPct)}%.`;
     }
+  } else if (weekly.length > 1) {
+    const prev = weekly[weekly.length - 2];
+    const revenuePct = percentChange(current.Revenue, prev.Revenue, 1);
+    const ordersPct = percentChange(current.Orders, prev.Orders, 1);
+    answer += ` Compared with ${prev.period}, Revenue ${revenuePct >= 0 ? "increased" : "decreased"} by ${Math.abs(revenuePct)}% and Orders ${ordersPct >= 0 ? "increased" : "decreased"} by ${Math.abs(ordersPct)}%.`;
   }
 
   return {
@@ -1050,13 +1098,37 @@ function answerMonthlySummary(question, rows, timeCols, metricMap) {
 function answerDailySummary(question, rows, timeCols, metricMap) {
   if (!isDailySummaryQuestion(question) || !timeCols.dateCol) return null;
 
-  const daily = aggregateByTime(rows, "date", timeCols, metricMap);
-  if (!daily.length) return null;
+  let grainNote = "";
+  const inferred = inferDatasetTemporalGranularity(rows, timeCols.dateCol);
+  if (inferred.grain === "week") {
+    grainNote =
+      "Dates in this file look **weekly** (about one row per week); each stored date is summarized as its own row (not a within-week daily rollup).\n\n";
+  } else if (inferred.grain === "month") {
+    grainNote =
+      "Timeline looks **monthly**; a true daily rollup is not available, so each distinct date/month value is summarized as stored.\n\n";
+  }
+
+  let daily = [];
+  try {
+    daily = aggregateByTime(rows, "date", timeCols, metricMap);
+  } catch (_err) {
+    return {
+      answer: grainNote + "Could not build a daily timeline from the date column in this upload.",
+      source: SOURCE_AI,
+    };
+  }
+
+  if (!daily.length) {
+    return {
+      answer: grainNote + "No parseable periods were found in the date column for a daily summary.",
+      source: SOURCE_AI,
+    };
+  }
 
   const current = daily[daily.length - 1];
   const previous = daily.length > 1 ? daily[daily.length - 2] : null;
 
-  let answer = `For ${current.period}, ${buildSnapshotMetricClause(current, metricMap)}.`;
+  let answer = grainNote + `For ${String(current.period ?? "")}, ${buildSnapshotMetricClause(current, metricMap)}.`;
 
   if (previous) {
     const revenuePct = percentChange(current.Revenue, previous.Revenue, 1);
@@ -1087,8 +1159,18 @@ function buildStructuredUserPrompt({ question, rows, columns, timeCols, metricMa
   let contextNote = "Row-level rows below.";
 
   if (timeIntent) {
-    preparedData = aggregateByTime(data, timeIntent, timeCols, metricMap).map(({ _rows, ...rest }) => rest);
-    contextNote = `Rows aggregated by ${timeIntent} for the time column.`;
+    let effectiveIntent = timeIntent;
+    if (timeIntent === "week" && !timeCols.weekCol && timeCols.dateCol) {
+      effectiveIntent = "date";
+      contextNote =
+        "Rows aggregated by **date** (no week column in the file; each distinct date is one period, which is typical for weekly exports).";
+    } else if (timeIntent === "month" && !timeCols.monthCol && timeCols.dateCol) {
+      effectiveIntent = "date";
+      contextNote = "Rows aggregated by **date** (no month column in the file).";
+    } else {
+      contextNote = `Rows aggregated by ${timeIntent} for the time column.`;
+    }
+    preparedData = aggregateByTime(data, effectiveIntent, timeCols, metricMap).map(({ _rows, ...rest }) => rest);
   } else {
     const dimReq = getRequestedDimension(question, cols);
     if (dimReq.column) {
@@ -1149,6 +1231,141 @@ function normalizeGroqResponse(raw) {
   return { answer: raw.trim(), source: SOURCE_AI };
 }
 
+
+const SOURCE_RULE = "rule-based";
+
+function buildComputedDataFallback(question, rows, columns, metrics) {
+  const data = Array.isArray(rows) ? rows : [];
+  const cols = getAllColumns(data, columns);
+  const numericCols = getNumericColumns(data, cols);
+  return {
+    kind: "dataset_profile",
+    question: String(question || "").trim(),
+    rowCount: data.length,
+    columns: cols,
+    numericColumns: numericCols,
+    primaryMetricId: metrics?.primaryMetricId ?? null,
+    primaryColumn: metrics?.primaryColumn ?? null,
+    missingRequestedMetricId: metrics?.missingRequestedMetricId ?? null,
+  };
+}
+
+function formatComputedFactsPlain(computed) {
+  if (computed?.missingRequestedMetricId) {
+    return buildMissingReferencedMetricMessage(computed.numericColumns || []);
+  }
+  return buildUnmatchedQuestionMessage(computed.columns || []);
+}
+
+async function askGroqExplainComputed({ question, computedData }) {
+  const apiKey = getGroqApiKey();
+  if (!apiKey || PLACEHOLDER_KEYS.has(apiKey.toLowerCase())) {
+    return {
+      answer: formatComputedFactsPlain(computedData),
+      source: SOURCE_AI,
+      confidence: "low",
+    };
+  }
+
+  const system = `You are DataSpeak. You receive ONLY authoritative JSON computed by the server from a CSV.
+Rules:
+- Output plain English only (no JSON in the answer).
+- Do NOT calculate, sum, average, or infer any numeric value that is not explicitly present in the JSON.
+- Do not rename columns; use exact strings from the JSON.
+- If the JSON is thin, say what is known and what question would help next.
+- Never invent totals or list sums of columns unless they appear explicitly in the JSON.`;
+
+  const user =
+    buildGroqUserContentPrefix(computedData.columns || []) +
+    "Dataset profile (authoritative — no per-column sums included):\n" +
+    JSON.stringify(computedData, null, 2) +
+    "\n\nUser question:\n" +
+    String(question || "").trim();
+
+  try {
+    const groq = new Groq({ apiKey });
+    const response = await groq.chat.completions.create({
+      model: GROQ_CHAT_MODEL,
+      temperature: 0.2,
+      messages: [
+        { role: "system", content: system },
+        { role: "user", content: user },
+      ],
+    });
+    const raw = response.choices?.[0]?.message?.content ?? "";
+    const text = typeof raw === "string" && raw.trim() ? raw.trim() : formatComputedFactsPlain(computedData);
+    return { answer: text, source: SOURCE_AI, confidence: "medium" };
+  } catch (_err) {
+    return {
+      answer: formatComputedFactsPlain(computedData),
+      source: SOURCE_AI,
+      confidence: "low",
+    };
+  }
+}
+
+function normalizeStackSource(out) {
+  if (!out) return null;
+  if (out.source === SOURCE_AI) return { ...out, source: SOURCE_RULE, confidence: "high" };
+  return { ...out, confidence: out.confidence || "high" };
+}
+
+function runGroqStackDeterministic(question, rows, columns) {
+  const data = Array.isArray(rows) ? rows : [];
+  const cols = getAllColumns(data, columns);
+  if (!data.length) return null;
+
+  const timeCols = getTimeColumns(cols);
+  const metricMap = getResolvedMetricMap(cols);
+  const q = normalizeQuestion(question);
+
+  const hit =
+    answerTotalSalesComposition(question, data, cols, metricMap, timeCols) ||
+    answerDailySummary(question, data, timeCols, metricMap) ||
+    answerWeeklySummary(question, data, timeCols, metricMap) ||
+    answerMonthlySummary(question, data, timeCols, metricMap) ||
+    answerRateDecreaseQuestion(question, data, timeCols, metricMap, cols) ||
+    (/\b(this week|last week|this month|last month|wow|mom|week over week|month over month)\b/.test(q) &&
+      answerWeeklyOrMonthlyComparison(question, data, timeCols, metricMap, cols)) ||
+    answerBreakdown(question, data, cols, timeCols, metricMap);
+
+  if (hit) return normalizeStackSource(hit);
+
+  if (isComparisonQuestion(question)) {
+    const dimReq = getRequestedDimension(question, cols);
+    const dimensionColumn =
+      dimReq.column ||
+      findColumnByAliases(cols, ["product", "region", "channel", "segment", "department", "team", "category"]);
+
+    if (!dimensionColumn) {
+      const available = listLikelyGroupingColumns(cols, metricMap, timeCols);
+      return normalizeStackSource({
+        answer:
+          `I could not find a suitable grouping column for comparison. ` +
+          `Available grouping columns are: ${available.length ? available.join(", ") : "none detected"}.`,
+        source: SOURCE_AI,
+      });
+    }
+
+    const aggregated = aggregateByDimension(data, dimensionColumn, metricMap);
+    if (aggregated.length >= 2) {
+      const metric = chooseChartMetric(question, metricMap, cols);
+      const topTwo = aggregated.slice(0, 2);
+      const mcol = physicalColumnName(metric, metricMap);
+      return normalizeStackSource({
+        answer:
+          `Comparing **${dimensionColumn}** values **${topTwo[0].label}** vs **${topTwo[1].label}** on column **${mcol}**: ` +
+          `${formatMetricValue(metric, topTwo[0][metric])} vs ${formatMetricValue(metric, topTwo[1][metric])}.`,
+        source: SOURCE_AI,
+        chartData: buildChartDataForBreakdown(question, topTwo, metricMap, cols),
+      });
+    }
+  }
+
+  return null;
+}
+
+
 async function askGroqNarrative({ question, rows, columns, timeCols, metricMap }) {
   const apiKey = getGroqApiKey();
   if (!apiKey || PLACEHOLDER_KEYS.has(apiKey.toLowerCase())) {
@@ -1207,7 +1424,10 @@ async function askGroqNarrative({ question, rows, columns, timeCols, metricMap }
  * @param {{ question: string, rows: object[], columns?: string[] }} params
  * @returns {Promise<{ answer: string, source: string, chartData?: object }>}
  */
-async function askGroqForInsight({ question, rows, columns }) {
+/**
+ * @param {{ question: string, rows: object[], columns?: string[], metrics?: object }} params
+ */
+async function askGroqForInsight({ question, rows, columns, metrics }) {
   const data = Array.isArray(rows) ? rows : [];
   const cols = getAllColumns(data, columns);
 
@@ -1215,88 +1435,22 @@ async function askGroqForInsight({ question, rows, columns }) {
     return {
       answer: "No dataset rows are available to analyze.",
       source: SOURCE_AI,
+      confidence: "low",
     };
   }
 
-  const timeCols = getTimeColumns(cols);
-  const metricMap = getResolvedMetricMap(cols);
-  const q = normalizeQuestion(question);
+  const fromStack = runGroqStackDeterministic(question, data, cols);
+  if (fromStack) return fromStack;
 
-  const totalSalesAnswer = answerTotalSalesComposition(question, data, cols, metricMap, timeCols);
-  if (totalSalesAnswer) return totalSalesAnswer;
-
-  const dailySummary = answerDailySummary(question, data, timeCols, metricMap);
-  if (dailySummary) return dailySummary;
-
-  const weeklySummary = answerWeeklySummary(question, data, timeCols, metricMap);
-  if (weeklySummary) return weeklySummary;
-
-  const monthlySummary = answerMonthlySummary(question, data, timeCols, metricMap);
-  if (monthlySummary) return monthlySummary;
-
-  const rateAnswer = answerRateDecreaseQuestion(question, data, timeCols, metricMap, cols);
-  if (rateAnswer) return rateAnswer;
-
-  if (
-    q.includes("this week") ||
-    q.includes("last week") ||
-    q.includes("this month") ||
-    q.includes("last month") ||
-    q.includes("week over week") ||
-    q.includes("month over month") ||
-    q.includes("wow") ||
-    q.includes("mom")
-  ) {
-    const compareAnswer = answerWeeklyOrMonthlyComparison(question, data, timeCols, metricMap, cols);
-    if (compareAnswer) return compareAnswer;
-  }
-
-  const breakdownAnswer = answerBreakdown(question, data, cols, timeCols, metricMap);
-  if (breakdownAnswer) return breakdownAnswer;
-
-  if (isComparisonQuestion(question)) {
-    const dimReq = getRequestedDimension(question, cols);
-    const dimensionColumn =
-      dimReq.column ||
-      findColumnByAliases(cols, ["product", "region", "channel", "segment", "department", "team", "category"]);
-
-    if (!dimensionColumn) {
-      const available = listLikelyGroupingColumns(cols, metricMap, timeCols);
-      return {
-        answer:
-          `I could not find a suitable grouping column for comparison. ` +
-          `Available grouping columns are: ${available.length ? available.join(", ") : "none detected"}.`,
-        source: SOURCE_AI,
-      };
-    }
-
-    const aggregated = aggregateByDimension(data, dimensionColumn, metricMap);
-    if (aggregated.length >= 2) {
-      const metric = chooseChartMetric(question, metricMap, cols);
-      const topTwo = aggregated.slice(0, 2);
-
-      const mcol = physicalColumnName(metric, metricMap);
-      return {
-        answer:
-          `Comparing **${dimensionColumn}** values **${topTwo[0].label}** vs **${topTwo[1].label}** on column **${mcol}**: ` +
-          `${formatMetricValue(metric, topTwo[0][metric])} vs ${formatMetricValue(metric, topTwo[1][metric])}.`,
-        source: SOURCE_AI,
-        chartData: buildChartDataForBreakdown(question, topTwo, metricMap, cols),
-      };
-    }
-  }
-
-  return askGroqNarrative({
-    question,
-    rows: data,
-    columns: cols,
-    timeCols,
-    metricMap,
-  });
+  const computed = buildComputedDataFallback(question, data, cols, metrics || {});
+  return askGroqExplainComputed({ question, computedData: computed });
 }
+
 
 module.exports = {
   askGroqForInsight,
+  askGroqExplainComputed,
+  runGroqStackDeterministic,
   GROQ_CHAT_MODEL,
   SOURCE_AI,
 };

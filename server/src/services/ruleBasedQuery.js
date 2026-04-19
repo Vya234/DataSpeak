@@ -23,6 +23,7 @@ const {
   summaryStats,
   detectTemporalColumn,
   detectGroupColumn,
+  bestFuzzyNumericColumnMatch,
 } = require("../utils/datasetAnalysis");
 
 const SOURCE_RULE = "rule-based";
@@ -74,6 +75,44 @@ function pickNumericColumn(question, numericCols) {
   const mentioned = columnMentionedInQuestion(question, numericCols);
   if (mentioned) return mentioned;
   if (numericCols.length === 1) return numericCols[0];
+  return null;
+}
+
+/** Text after "total" / "sum …" for matching a specific numeric column (e.g. "total escalation rate"). */
+function extractPhraseAfterTotalVerb(q) {
+  const lower = String(q || "").toLowerCase().trim();
+  const patterns = [
+    /\b(?:what\s+is|what's|whats|give\s+me|show\s+me|find|calculate)\s+(?:the\s+)?(?:total|sum)\s+(?:of\s+)?(.+)/i,
+    /\b(?:total|sum|overall|combined)\s+(?:of\s+)?(.+)/i,
+  ];
+  for (const p of patterns) {
+    const m = lower.match(p);
+    if (m && m[1]) {
+      const rest = m[1].trim().replace(/\?+$/g, "").trim();
+      if (rest.length >= 2) return rest;
+    }
+  }
+  return null;
+}
+
+function pickTotalMetricColumn(q, numericCols) {
+  if (numericCols.length === 0) return null;
+  const mentioned = columnMentionedInQuestion(q, numericCols);
+  if (mentioned) return mentioned;
+
+  const afterTotal = extractPhraseAfterTotalVerb(q);
+  if (afterTotal && numericCols.length > 1) {
+    const hit = bestFuzzyNumericColumnMatch(afterTotal, numericCols, { minScore: 3, minDelta: 0.5 });
+    if (hit) return hit;
+  }
+
+  if (numericCols.length === 1) return numericCols[0];
+
+  if (numericCols.length > 1) {
+    const hit = bestFuzzyNumericColumnMatch(q, numericCols, { minScore: 4, minDelta: 1 });
+    if (hit) return hit;
+  }
+
   return null;
 }
 
@@ -352,28 +391,15 @@ function tryBottomNRule(q, data, cols) {
 function tryTotalRule(q, data, cols) {
   if (!wantsTotal(q.toLowerCase())) return null;
   const numericCols = getNumericColumns(data, cols);
-  const targetCol = pickNumericColumn(q, numericCols);
+  const targetCol = pickTotalMetricColumn(q, numericCols);
   if (!targetCol) return null;
 
   const total = sumColumn(data, targetCol);
   const n = countNumericInColumn(data, targetCol);
-  const avg = avgColumn(data, targetCol);
   const formatted = formatNumber(total);
 
-  // Find top contributor group
-  const labelCol = getDefaultLabelColumn(data, cols, numericCols);
-  const grouped = labelCol ? groupBy(data, labelCol, [targetCol]) : [];
-  const topGroup = grouped[0];
-  const topContrib = topGroup && total > 0
-    ? ((topGroup[`${targetCol}_sum`] / total) * 100).toFixed(1)
-    : null;
-
   return {
-    answer:
-      `Total **${targetCol}** is **${formatted}** across **${n}** rows (avg: **${formatNumber(avg)}**). ` +
-      (topGroup && topContrib
-        ? `**${topGroup.group}** contributes the most at **${formatNumber(topGroup[`${targetCol}_sum`])}** (${topContrib}% of total).`
-        : ""),
+    answer: `Total **${targetCol}** is **${formatted}** (from **${n}** rows with numeric values in that column).`,
     source: SOURCE_RULE,
   };
 }
@@ -467,7 +493,7 @@ function tryRangeRule(q, data, cols) {
 
 /**
  * Deterministic rule-based answers.
- * Order: topN → bottomN → trend → groupBy → chart → count → total → average → range → highest → lowest.
+ * Order: topN → bottomN → trend → groupBy → chart → total → count → average → range → highest → lowest.
  * @returns {{ answer: string, source: string, chartData?: object } | null}
  */
 function questionSeeksCausalExplanation(q) {
@@ -495,8 +521,8 @@ function tryRuleBasedAnswer({ question, rows, columns }) {
     tryTrendRule(q, data, cols) ||
     tryGroupByRule(q, data, cols) ||
     tryChartRule(q, data, cols) ||
-    tryCountRule(q, data, cols) ||
     tryTotalRule(q, data, cols) ||
+    tryCountRule(q, data, cols) ||
     tryAverageRule(q, data, cols) ||
     tryRangeRule(q, data, cols) ||
     tryHighestRule(q, data, cols) ||

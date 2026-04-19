@@ -60,35 +60,7 @@
 //   return MONTH_WORDS[s.slice(0, 3)] ?? null;
 // }
 
-// /**
-//  * Single primary intent — strict priority (do not mix).
-//  * Order: DRIVER → COMPARISON → TREND → TOP_N → BREAKDOWN → SUMMARY.
-//  */
-// function detectIntent(question) {
-//   const lower = String(question || "").toLowerCase();
-
-//   if (/\b(why|cause|causes|reason|reasons|what caused|what drove|due to|driver)\b/i.test(lower)) {
-//     return { type: "driver", raw: question };
-//   }
-//   if (/\b(compare|comparison|versus|vs\.?)\b/i.test(lower) || /\bbetween\s+.+\s+and\s+/i.test(question)) {
-//     return { type: "comparison", raw: question };
-//   }
-//   if (/\b(trend|over time|over the period|trajectory)\b/i.test(lower)) {
-//     return { type: "trend", raw: question };
-//   }
-//   if (/\b(top\s*\d+|bottom\s*\d+|highest\s+\d+|best\s+\d+|worst\s+\d+)\b/i.test(lower) || /\b(top|highest|lowest)\b/i.test(lower)) {
-//     return { type: "top_n", raw: question };
-//   }
-//   if (/\b(summary|overview|recap|snapshot)\b/i.test(lower)) {
-//     return { type: "summary", raw: question };
-//   }
-//   if (/\b(breakdown|composition)\b/i.test(lower) || /\bby\b/i.test(lower)) {
-//     return { type: "breakdown", raw: question };
-//   }
-//   return { type: "general", raw: question };
-// }
-
-// /** User-requested series grain from wording (null = no explicit constraint). */
+/** User-requested series grain from wording (null = no explicit constraint). */
 // function inferRequestedSeriesGrain(question) {
 //   const lower = String(question || "").toLowerCase();
 //   if (/\bdaily\b|day[- ]by[- ]day|each\s+day|per\s+day\b/i.test(lower)) return "day";
@@ -858,6 +830,15 @@ const {
 const { METRIC_DICTIONARY, findColumnForAliases } = require("./metricResolver");
 const { extractEntityPair, isRelativeTimeEntityPair } = require("./intentParser");
 const { tryTimeComparisonAndDriver } = require("./deterministicAnalytics");
+const { detectIntent: detectIntentLabel } = require("./intentClassifier");
+const {
+  inferGroupByFromExplicitDimensionWord,
+  inferGroupByFromCategoricalFuzzyMatch,
+} = require("./structuredQuery");
+const {
+  pickSummaryMetricColumn,
+  computeSummaryBucketsWithFallback,
+} = require("../lib/summaryHelpers");
 
 const MONTH_WORDS = {
   january: 1,
@@ -898,43 +879,28 @@ function normMonthToken(t) {
 
 /**
  * Single primary intent — strict priority (do not mix).
- * Order: DRIVER → COMPARISON → TREND → TOP_N → BREAKDOWN → SUMMARY.
+ * Uses intentClassifier labels; maps to legacy `type` for tests.
  */
 function detectIntent(question) {
+  const label = detectIntentLabel(question);
   const lower = String(question || "").toLowerCase();
 
-  if (/\b(why|cause|causes|reason|reasons|what caused|what drove|due to|driver)\b/i.test(lower)) {
-    return { type: "driver", raw: question };
+  let type = "general";
+  if (label === "why") type = "driver";
+  else if (label === "unknown") {
+    if (
+      /\b(top\s*\d+|bottom\s*\d+|highest\s+\d+|best\s+\d+|worst\s+\d+)\b/i.test(lower) ||
+      (/\b(top|highest|lowest)\b/i.test(lower) && !/\btopical\b/i.test(lower))
+    ) {
+      type = "top_n";
+    } else {
+      type = "general";
+    }
+  } else {
+    type = label;
   }
-  if (
-    /\bacross\b.*\b(regions?|products?|channels?|categor|segments?)\b/i.test(lower) ||
-    /\b(compare|comparison|versus|vs\.?)\b/i.test(lower) ||
-    /\bbetween\s+.+\s+and\s+/i.test(question)
-  ) {
-    return { type: "comparison", raw: question };
-  }
-  if (/\b(trend|over time|over the period|trajectory)\b/i.test(lower)) {
-    return { type: "trend", raw: question };
-  }
-  if (
-    /\b(top\s*\d+|bottom\s*\d+|highest\s+\d+|best\s+\d+|worst\s+\d+)\b/i.test(lower) ||
-    /\b(top|highest|lowest)\b/i.test(lower)
-  ) {
-    return { type: "top_n", raw: question };
-  }
-  if (
-    /\b(summary|overview|recap|snapshot)\b/i.test(lower) ||
-    /\b(monthly|weekly|daily)\s+(analysis|review|report)\b/i.test(lower) ||
-    /\bgive me (a )?monthly analysis\b/i.test(lower) ||
-    /\banalyze (this month|the latest month)\b/i.test(lower) ||
-    /\b(latest|this) month analysis\b/i.test(lower)
-  ) {
-    return { type: "summary", raw: question };
-  }
-  if (/\b(breakdown|composition)\b/i.test(lower) || /\bby\b/i.test(lower)) {
-    return { type: "breakdown", raw: question };
-  }
-  return { type: "general", raw: question };
+
+  return { type, raw: question, intentLabel: label };
 }
 
 /** User-requested series grain from wording (null = no explicit constraint). */
@@ -1007,12 +973,8 @@ function validateData({ question, columns, rows, metrics, dateCol, timeGrainRequ
     /\bdaily\s+(analysis|review|report)\b/i.test(lower) || /\banalyze (today|this day)\b/i.test(lower);
 
   if ((wantsDailySummary || wantsDailyAnalysis) && dataGrain !== "day") {
-    return {
-      ok: false,
-      message: "This dataset does not support daily analysis.",
-      validation_status: "unsupported_granularity",
-      warnings: ["no_daily_grain"],
-    };
+    warnings.push("no_daily_grain");
+    if (status === "ok") status = "degraded_granularity";
   }
 
   const wantsWeeklySummaryOrAnalysis =
@@ -1021,30 +983,17 @@ function validateData({ question, columns, rows, metrics, dateCol, timeGrainRequ
     /\bgive me (a )?weekly summary\b/i.test(lower);
 
   if (wantsWeeklySummaryOrAnalysis && dateCol && (dataGrain === "month" || dataGrain === "unknown")) {
-    return {
-      ok: false,
-      message: "Weekly summary is not supported because the dataset granularity is monthly.",
-      validation_status: "unsupported_granularity",
-      warnings: ["dataset_not_weekly"],
-    };
+    warnings.push("dataset_not_weekly");
+    if (status === "ok") status = "degraded_granularity";
   }
 
   if (timeGrainRequired === "week" || requestedGrain === "week") {
     if (!dateCol) {
-      return {
-        ok: false,
-        message: "This dataset has monthly granularity, not weekly.",
-        validation_status: "unsupported_granularity",
-        warnings: ["dataset_not_weekly"],
-      };
-    }
-    if (dataGrain === "month" || dataGrain === "unknown") {
-      return {
-        ok: false,
-        message: "This dataset has monthly granularity, not weekly.",
-        validation_status: "unsupported_granularity",
-        warnings: ["dataset_not_weekly"],
-      };
+      warnings.push("dataset_not_weekly");
+      if (status === "ok") status = "degraded_granularity";
+    } else if (dataGrain === "month" || dataGrain === "unknown") {
+      warnings.push("dataset_not_weekly");
+      if (status === "ok") status = "degraded_granularity";
     }
   }
 
@@ -1053,12 +1002,8 @@ function validateData({ question, columns, rows, metrics, dateCol, timeGrainRequ
     requestedGrain === "day" &&
     (dataGrain === "month" || dataGrain === "week")
   ) {
-    return {
-      ok: false,
-      message: "This dataset does not support daily analysis.",
-      validation_status: "unsupported_granularity",
-      warnings: ["no_daily_grain"],
-    };
+    warnings.push("no_daily_grain");
+    if (status === "ok") status = "degraded_granularity";
   }
 
   if (
@@ -1066,12 +1011,8 @@ function validateData({ question, columns, rows, metrics, dateCol, timeGrainRequ
     requestedGrain === "week" &&
     dataGrain === "month"
   ) {
-    return {
-      ok: false,
-      message: "This dataset has monthly granularity, not weekly.",
-      validation_status: "unsupported_granularity",
-      warnings: ["dataset_not_weekly"],
-    };
+    warnings.push("dataset_not_weekly");
+    if (status === "ok") status = "degraded_granularity";
   }
 
   return { ok: true, validation_status: status, warnings };
@@ -1646,25 +1587,15 @@ function trendAnalysis({ question, rows, columns, metrics, dateCol }) {
 
   const reqG = inferRequestedSeriesGrain(question);
   const dataGrain = dateCol ? inferDatasetTemporalGranularity(rows, dateCol).grain : "unknown";
+  let grainNote = "";
   if (reqG === "day" && (dataGrain === "month" || dataGrain === "week")) {
-    return {
-      answer: "This dataset does not support daily analysis.",
-      source: "computed",
-      confidence: "high",
-      reasoning_mode: "safe_refusal",
-      validation_status: "unsupported_granularity",
-      warnings: ["no_daily_grain"],
-    };
-  }
-  if (reqG === "week" && dataGrain === "month") {
-    return {
-      answer: "This dataset has monthly granularity, not weekly.",
-      source: "computed",
-      confidence: "high",
-      reasoning_mode: "safe_refusal",
-      validation_status: "unsupported_granularity",
-      warnings: ["dataset_not_weekly"],
-    };
+    grainNote =
+      "Showing **monthly** trend (finest granularity available in your data). ";
+  } else if (reqG === "week" && dataGrain === "month") {
+    grainNote =
+      "Showing **monthly** trend (finest granularity available in your data). ";
+  } else if (reqG === "week" && dataGrain === "unknown") {
+    grainNote = "Showing trend at the **available time resolution** in your data. ";
   }
 
   const labelCol = dateCol || detectTemporalColumn(columns);
@@ -1691,7 +1622,8 @@ function trendAnalysis({ question, rows, columns, metrics, dateCol }) {
   const change = to - from;
   const changePct = from !== 0 ? ((change / Math.abs(from)) * 100).toFixed(1) : null;
 
-  let answer = `**${metrics.primaryMetricId || valueCol}** (${valueCol}) over **${labelCol}**: `;
+  let answer = grainNote;
+  answer += `**${metrics.primaryMetricId || valueCol}** (${valueCol}) over **${labelCol}**: `;
   answer += `from **${formatNumber(from)}** (${firstLabel}) to **${formatNumber(to)}** (${lastLabel})`;
   if (changePct !== null) answer += ` — about **${change >= 0 ? "+" : ""}${changePct}%** vs the start of the series.`;
   answer += ` Direction: **${direction}** (range **${formatNumber(min)}**–**${formatNumber(max)}** across **${labels.length}** time periods).`;
@@ -1712,7 +1644,7 @@ function trendAnalysis({ question, rows, columns, metrics, dateCol }) {
 }
 
 function breakdownAnalysis({ question, rows, columns, metrics }) {
-  const valueCol = metrics.primaryColumn;
+  const valueCol = pickSummaryMetricColumn(question, rows, columns) || metrics.primaryColumn;
   if (!valueCol) {
     return {
       answer: "Could not determine which numeric column to break down.",
@@ -1727,8 +1659,17 @@ function breakdownAnalysis({ question, rows, columns, metrics }) {
   const nonNumeric = columns.filter((c) => !numericCols.includes(c));
   const lower = String(question || "").toLowerCase();
 
-  let dim = columnMentionedInQuestion(question, nonNumeric);
+  let dim = inferGroupByFromCategoricalFuzzyMatch(question, columns, rows);
   let prefix = "";
+
+  if (!dim) {
+    dim = columnMentionedInQuestion(question, nonNumeric);
+  }
+
+  if (!dim) {
+    const explicitDim = inferGroupByFromExplicitDimensionWord(question, columns);
+    if (explicitDim) dim = explicitDim;
+  }
 
   if (!dim && /\bcategory|categories\b/i.test(lower)) {
     const productCol = findColumnForAliases(columns, ["product", "sku", "item"]);
@@ -1798,8 +1739,9 @@ function breakdownAnalysis({ question, rows, columns, metrics }) {
   };
 }
 
-function summaryAnalysis({ rows, columns, metrics, dateCol }) {
-  const primary = metrics.primaryColumn;
+function summaryAnalysis({ rows, columns, metrics, dateCol, question }) {
+  const q = String(question || "");
+  const primary = pickSummaryMetricColumn(q, rows, columns) || metrics.primaryColumn;
   if (!primary) return null;
 
   const stats = summaryStats(rows, columns);
@@ -1812,13 +1754,22 @@ function summaryAnalysis({ rows, columns, metrics, dateCol }) {
   let stability = "";
 
   if (temporal) {
-    const buckets = groupByTime(rows, temporal, [primary], "sum");
+    const requested = inferRequestedSeriesGrain(q) || "month";
+    const { buckets, prefix: grainPrefix } = computeSummaryBucketsWithFallback(
+      rows,
+      temporal,
+      primary,
+      "sum",
+      requested
+    );
     if (buckets.length >= 2) {
       const vals = buckets.map((b) => Number(b[primary]) || 0);
       const last = vals[vals.length - 1];
       const prev = vals[vals.length - 2];
       const pct = prev !== 0 ? (((last - prev) / Math.abs(prev)) * 100).toFixed(1) : last === 0 ? "0" : "—";
-      latestChange = `Latest period vs prior: **${formatNumber(last)}** vs **${formatNumber(prev)}** (${pct}%). `;
+      latestChange =
+        (grainPrefix || "") +
+        `Latest period vs prior: **${formatNumber(last)}** vs **${formatNumber(prev)}** (${pct}%). `;
 
       const dir = detectTrendDirection(vals);
       overallTrend = `Overall series trend: **${dir}** (from **${formatNumber(vals[0])}** to **${formatNumber(last)}**). `;
@@ -1832,11 +1783,13 @@ function summaryAnalysis({ rows, columns, metrics, dateCol }) {
           : cv < 0.35
             ? "Period-to-period variation is **moderate**."
             : "Period-to-period variation is **high**.";
+    } else if (grainPrefix) {
+      latestChange = grainPrefix;
     }
   }
 
   const answer =
-    `**${metrics.primaryMetricId || primary}** — total **${formatNumber(s0.sum)}**, average **${formatNumber(s0.avg)}**, range **${formatNumber(s0.min)}**–**${formatNumber(s0.max)}**. ` +
+    `**${primary}** — total **${formatNumber(s0.sum)}**, average **${formatNumber(s0.avg)}**, range **${formatNumber(s0.min)}**–**${formatNumber(s0.max)}**. ` +
     (latestChange || "") +
     (overallTrend || `Across all rows, values span **${formatNumber(s0.min)}** to **${formatNumber(s0.max)}**. `) +
     (stability || "");

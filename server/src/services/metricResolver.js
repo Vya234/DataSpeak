@@ -7,6 +7,7 @@ const {
   getNumericColumns,
   columnMentionedInQuestion,
   inferColumnsFromRows,
+  bestFuzzyNumericColumnMatch,
 } = require("../utils/datasetAnalysis");
 
 /**
@@ -74,7 +75,15 @@ const METRIC_DICTIONARY = [
   },
   {
     id: "CSAT",
-    aliases: ["csat", "csat score", "csat_score", "customer satisfaction"],
+    aliases: [
+      "csat",
+      "csat score",
+      "csat_score",
+      "customer satisfaction",
+      "customersatisfaction",
+      "customer_satisfaction",
+      "customersatisfactionscore",
+    ],
     preferAggregation: "avg",
   },
   {
@@ -176,7 +185,14 @@ function resolveMetricColumns(columns, rows) {
   const numericCols = new Set(getNumericColumns(rows || [], columns || []));
   const map = {};
   for (const def of METRIC_DICTIONARY) {
-    const col = findColumnForAliases(columns, def.aliases);
+    let col = findColumnForAliases(columns, def.aliases);
+    if (
+      def.id === "Customers" &&
+      col &&
+      /\b(complaint|ticket|issue|case|escalat|support)\b/i.test(normalizeToken(col))
+    ) {
+      col = null;
+    }
     if (col && numericCols.has(col)) map[def.id] = { column: col, preferAggregation: def.preferAggregation };
   }
   return map;
@@ -222,12 +238,23 @@ function resolvePrimaryMetric(question, columns, rows, metricColumns) {
     if (metricColumns.Cost) return "Cost";
     if (metricColumns.AdSpend) return "AdSpend";
   }
-  if (/\bcustomers?\b|\bnum customers\b/i.test(question) && metricColumns.Customers) return "Customers";
-  if (/\bcomplaints\b|\btickets\b|\bsupport tickets\b/i.test(question) && metricColumns.Customers) return "Customers";
+  if (/\bcustomers?\b|\bnum customers\b/i.test(question) && metricColumns.Customers) {
+    const cn = normalizeToken(metricColumns.Customers.column);
+    if (/\bcomplaint|ticket|issue|case|escalat|support\b/.test(cn)) return null;
+    return "Customers";
+  }
   if (/\bnps\b|net promoter/i.test(question) && metricColumns.NPS) return "NPS";
   if (/\bcsat\b|customer satisfaction/i.test(question) && metricColumns.CSAT) return "CSAT";
   if (/\bactive users\b|\bmau\b|\bdau\b/i.test(question) && metricColumns.ActiveUsers) return "ActiveUsers";
   if (/\bgross margin\b|margin pct/i.test(question) && metricColumns.GrossMarginPct) return "GrossMarginPct";
+
+  const fuzzyCol = bestFuzzyNumericColumnMatch(question, numericCols, { minScore: 4, minDelta: 0.75 });
+  if (fuzzyCol) {
+    for (const def of METRIC_DICTIONARY) {
+      if (metricColumns[def.id]?.column === fuzzyCol) return def.id;
+    }
+    return null;
+  }
 
   if (metricColumns.Revenue) return "Revenue";
   const keys = Object.keys(metricColumns);
@@ -280,6 +307,14 @@ function resolveMetrics(ctx) {
   if (!primaryColumn) {
     const mentioned = columnMentionedInQuestion(question, cols);
     if (mentioned && numericColumns.includes(mentioned)) primaryColumn = mentioned;
+  }
+  if (!primaryColumn) {
+    const fz = bestFuzzyNumericColumnMatch(question, numericColumns, { minScore: 4, minDelta: 0.75 });
+    if (fz) {
+      const dictDef = METRIC_DICTIONARY.find((def) => metricColumns[def.id]?.column === fz);
+      if (dictDef) primaryMetricId = dictDef.id;
+      primaryColumn = fz;
+    }
   }
   if (!primaryColumn && numericColumns.length === 1) primaryColumn = numericColumns[0];
 

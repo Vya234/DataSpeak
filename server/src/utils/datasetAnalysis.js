@@ -115,6 +115,135 @@ function columnMentionedInQuestion(question, columns) {
   return null;
 }
 
+const FUZZY_MATCH_STOPWORDS = new Set([
+  "the",
+  "a",
+  "an",
+  "is",
+  "are",
+  "was",
+  "were",
+  "what",
+  "how",
+  "give",
+  "me",
+  "show",
+  "tell",
+  "please",
+  "total",
+  "sum",
+  "overall",
+  "combined",
+  "of",
+  "for",
+  "in",
+  "on",
+  "to",
+  "by",
+  "from",
+  "with",
+  "this",
+  "that",
+  "my",
+  "our",
+  "dataset",
+  "data",
+  "column",
+  "value",
+  "values",
+  "number",
+  "numbers",
+  "all",
+  "across",
+  "and",
+  "or",
+  "vs",
+  "per",
+  "each",
+]);
+
+/** Lowercase, split camelCase, collapse punctuation — for fuzzy column ↔ question matching. */
+function normalizeForFuzzyMatch(s) {
+  return String(s || "")
+    .toLowerCase()
+    .replace(/[_\-]+/g, " ")
+    .replace(/([a-z0-9])([A-Z])/g, "$1 $2")
+    .replace(/[^\w\s]/g, " ")
+    .replace(/\s+/g, " ")
+    .trim();
+}
+
+function tokenizeForFuzzyMatch(normalized) {
+  return normalized
+    .split(/\s+/)
+    .map((t) => t.trim())
+    .filter((t) => t.length > 1 && !FUZZY_MATCH_STOPWORDS.has(t));
+}
+
+/**
+ * Pick the numeric column whose name best matches the question (or a short phrase).
+ * Returns null when scores are low or ambiguous.
+ * @param {string} questionOrPhrase
+ * @param {string[]} numericColumns
+ * @param {{ minScore?: number, minDelta?: number }} [options]
+ */
+function bestFuzzyNumericColumnMatch(questionOrPhrase, numericColumns, options = {}) {
+  const minScore = options.minScore ?? 4;
+  const minDelta = options.minDelta ?? 1;
+  if (!questionOrPhrase || !Array.isArray(numericColumns) || numericColumns.length === 0) return null;
+
+  const qNorm = normalizeForFuzzyMatch(questionOrPhrase);
+  if (!qNorm) return null;
+  const qTokens = tokenizeForFuzzyMatch(qNorm);
+
+  let best = { col: null, score: -Infinity };
+  let second = -Infinity;
+
+  for (const col of numericColumns) {
+    if (!col) continue;
+    const cNorm = normalizeForFuzzyMatch(col);
+    if (!cNorm) continue;
+
+    let score = 0;
+    if (cNorm.length >= 4 && qNorm.includes(cNorm)) score += 45;
+    if (qNorm.length >= 5 && cNorm.includes(qNorm)) score += 28;
+
+    const cTokens = tokenizeForFuzzyMatch(cNorm);
+    const qset = new Set(qTokens.filter((t) => t.length >= 3));
+    let inter = 0;
+    for (const t of cTokens) {
+      if (t.length < 3) continue;
+      if (qset.has(t)) {
+        inter++;
+        score += 12;
+        continue;
+      }
+      for (const qt of qTokens) {
+        if (qt.length < 3) continue;
+        if (t === qt) {
+          score += 12;
+          break;
+        }
+        if (t.length >= 4 && qt.length >= 4 && (t.includes(qt) || qt.includes(t))) {
+          score += 6;
+        }
+      }
+    }
+    if (cTokens.length) score += (inter / Math.max(1, cTokens.length)) * 14;
+
+    if (score > best.score) {
+      second = best.score;
+      best = { col, score };
+    } else if (score > second) {
+      second = score;
+    }
+  }
+
+  if (!best.col || best.score < minScore) return null;
+  if (best.score - second < minDelta) return null;
+  return best.col;
+}
+
 function inferColumnsFromRows(rows) {
   if (!rows || rows.length === 0) return [];
   return Object.keys(rows[0]);
@@ -263,6 +392,35 @@ function monthName(n) {
 }
 
 /**
+ * ISO 8601 week sort key + label (YYYY-Www), aligned with parseDateToken week keys (year*10000 + week*100).
+ * @param {number} y
+ * @param {number} mo 1–12
+ * @param {number} d 1–31
+ */
+function isoWeekBucketFromCalendarDate(y, mo, d) {
+  const date = new Date(Date.UTC(y, mo - 1, d));
+  const dayNr = (date.getUTCDay() + 6) % 7;
+  date.setUTCDate(date.getUTCDate() - dayNr + 3);
+  const isoYear = date.getUTCFullYear();
+  const week1 = new Date(Date.UTC(isoYear, 0, 4));
+  const week =
+    1 +
+    Math.round(
+      ((date.getTime() - week1.getTime()) / 86400000 - 3 + ((week1.getUTCDay() + 6) % 7)) / 7
+    );
+  const w = Math.min(Math.max(week, 1), 53);
+  const label = `${isoYear}-W${String(w).padStart(2, "0")}`;
+  return { sortKey: isoYear * 10000 + w * 100, label };
+}
+
+function formatDayLabelFromSortKey(sortKey) {
+  const y = Math.floor(sortKey / 10000);
+  const mo = Math.floor((sortKey % 10000) / 100);
+  const d = sortKey % 100;
+  return `${y}-${String(mo).padStart(2, "0")}-${String(d).padStart(2, "0")}`;
+}
+
+/**
  * Groups rows by a time column into monthly (or weekly) buckets,
  * aggregating numeric columns by SUM (for flow metrics like sales/revenue)
  * or AVERAGE (for stock metrics like price/rating).
@@ -274,10 +432,11 @@ function monthName(n) {
  * @param {string}   timeCol   - the date/week/month column name
  * @param {string[]} valueCols - numeric columns to aggregate
  * @param {"sum"|"avg"} [agg="sum"]
+ * @param {"month"|"week"|"day"} [timeGrain="month"] — how to bucket the timeline before aggregating values.
  * @returns {{ label: string, sortKey: number, [col]: number }[]}
  *   Sorted chronologically by sortKey.
  */
-function groupByTime(rows, timeCol, valueCols, agg = "sum") {
+function groupByTime(rows, timeCol, valueCols, agg = "sum", timeGrain = "month") {
   if (!timeCol || !Array.isArray(valueCols) || valueCols.length === 0) return [];
 
   const buckets = new Map(); // bucketKey → { label, sortKey, sums:{}, counts:{} }
@@ -288,28 +447,74 @@ function groupByTime(rows, timeCol, valueCols, agg = "sum") {
 
     const { sortKey, label } = parseDateToken(raw);
 
-    // Normalise to month-level bucket key:
-    //   - Full date sortKey (e.g. 20240115) → strip day → 20240100
-    //   - Week sortKey (e.g. 20240300) already has 00 day → keep as-is
-    //   - Zero sortKey (unparseable) → fall back to the label string itself
     let bucketKey;
-    if (sortKey > 0) {
-      // YYYYMMDD → YYYYMM00  (zeros out the day component)
-      bucketKey = Math.floor(sortKey / 100) * 100;
-    } else {
-      bucketKey = label || raw; // string fallback
-    }
-
-    // Canonical label for this bucket: derive from the truncated sortKey
     let canonicalLabel = label;
-    if (typeof bucketKey === "number" && bucketKey > 0) {
-      const y = Math.floor(bucketKey / 10000);
-      const m = Math.floor((bucketKey % 10000) / 100);
-      // Only convert to "Mon YYYY" for actual calendar months (1–12).
-      // Week buckets already carry a meaningful label from parseDateToken — leave them.
-      const isWeekBucket = label.toLowerCase().includes("w") || label.toLowerCase().includes("week");
-      if (!isWeekBucket && m >= 1 && m <= 12) {
-        canonicalLabel = `${monthName(m)} ${y}`;
+
+    if (timeGrain === "day") {
+      if (sortKey > 0) {
+        const dpart = sortKey % 100;
+        const mpart = Math.floor((sortKey % 10000) / 100);
+        const ypart = Math.floor(sortKey / 10000);
+        if (dpart >= 1 && dpart <= 31 && mpart >= 1 && mpart <= 12) {
+          bucketKey = sortKey;
+          canonicalLabel = formatDayLabelFromSortKey(sortKey);
+        } else {
+          bucketKey = Math.floor(sortKey / 100) * 100;
+          const y = Math.floor(bucketKey / 10000);
+          const m = Math.floor((bucketKey % 10000) / 100);
+          if (m >= 1 && m <= 12) canonicalLabel = `${monthName(m)} ${y}`;
+          else canonicalLabel = label;
+        }
+      } else {
+        bucketKey = label || raw;
+        canonicalLabel = String(label || raw);
+      }
+    } else if (timeGrain === "week") {
+      const labStr = String(label ?? "");
+      const looksLikeWeek =
+        /\bW\d{1,2}\b/i.test(labStr) || /\bweek\b/i.test(labStr.toLowerCase());
+      if (sortKey > 0 && looksLikeWeek) {
+        bucketKey = sortKey;
+        canonicalLabel = labStr;
+      } else if (sortKey > 0) {
+        const dpart = sortKey % 100;
+        const mpart = Math.floor((sortKey % 10000) / 100);
+        const ypart = Math.floor(sortKey / 10000);
+        if (dpart >= 1 && dpart <= 31 && mpart >= 1 && mpart <= 12) {
+          const iw = isoWeekBucketFromCalendarDate(ypart, mpart, dpart);
+          bucketKey = iw.sortKey;
+          canonicalLabel = iw.label;
+        } else if (dpart === 0 && mpart >= 1 && mpart <= 12) {
+          const iw = isoWeekBucketFromCalendarDate(ypart, mpart, 1);
+          bucketKey = iw.sortKey;
+          canonicalLabel = iw.label;
+        } else {
+          bucketKey = Math.floor(sortKey / 100) * 100;
+          const y = Math.floor(bucketKey / 10000);
+          const m = Math.floor((bucketKey % 10000) / 100);
+          if (m >= 1 && m <= 12) canonicalLabel = `${monthName(m)} ${y}`;
+          else canonicalLabel = label;
+        }
+      } else {
+        bucketKey = label || raw;
+        canonicalLabel = String(label || raw);
+      }
+    } else {
+      // month (default): collapse to calendar month
+      if (sortKey > 0) {
+        bucketKey = Math.floor(sortKey / 100) * 100;
+      } else {
+        bucketKey = label || raw;
+      }
+
+      if (typeof bucketKey === "number" && bucketKey > 0) {
+        const y = Math.floor(bucketKey / 10000);
+        const m = Math.floor((bucketKey % 10000) / 100);
+        const labStr = String(label ?? "");
+        const isWeekBucket = labStr.toLowerCase().includes("w") || labStr.toLowerCase().includes("week");
+        if (!isWeekBucket && m >= 1 && m <= 12) {
+          canonicalLabel = `${monthName(m)} ${y}`;
+        }
       }
     }
 
@@ -684,6 +889,7 @@ module.exports = {
   extremesByValue,
   formatNumber,
   columnMentionedInQuestion,
+  bestFuzzyNumericColumnMatch,
   inferColumnsFromRows,
   groupBy,
   detectTrend,

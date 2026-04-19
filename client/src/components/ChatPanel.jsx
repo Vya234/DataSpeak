@@ -91,11 +91,16 @@ function FollowUpChips({ questions, onPick, disabled }) {
 
 export default function ChatPanel({ messages, onAsk, disabled, loading }) {
   const [input, setInput] = useState("");
-  const endRef = useRef(null);
+  const messagesRef = useRef(null);
 
   useEffect(() => {
-    endRef.current?.scrollIntoView({ behavior: "smooth" });
-  }, [messages.length, loading]);
+    const el = messagesRef.current;
+    if (!el) return;
+    const id = requestAnimationFrame(() => {
+      el.scrollTo({ top: el.scrollHeight, behavior: "smooth" });
+    });
+    return () => cancelAnimationFrame(id);
+  }, [messages, loading]);
 
   async function submit(e) {
     e.preventDefault();
@@ -114,7 +119,7 @@ export default function ChatPanel({ messages, onAsk, disabled, loading }) {
 
   return (
     <div className="chat">
-      <div className="messages">
+      <div className="messages" ref={messagesRef}>
         {messages.map((m, idx) => (
           <div key={idx} className={`msg ${m.role}`}>
             <div className="msgInner">
@@ -142,7 +147,6 @@ export default function ChatPanel({ messages, onAsk, disabled, loading }) {
           </div>
         ))}
         {loading && <AnswerSkeleton />}
-        <div ref={endRef} />
       </div>
 
       <div className="chatInputWrap">

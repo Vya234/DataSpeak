@@ -1,4 +1,4 @@
-const { groupByTime, detectTemporalColumn } = require("../utils/datasetAnalysis");
+const { groupByTime, detectTemporalColumn, getNumericColumns, sumColumn } = require("../utils/datasetAnalysis");
 
 function buildDataUsedMeta({
   columnsUsed,
@@ -43,30 +43,86 @@ function appendDataUsedIfMissing(answer, meta) {
   return a + formatDataUsedBlock(meta);
 }
 
-function suggestFollowUps({ columns, question, dateCol }) {
-  const lower = String(question || "").toLowerCase();
-  const chips = [];
-  const hasRegion = columns.some((c) => /region|territory|area/i.test(c));
-  const hasProduct = columns.some((c) => /product|sku|item/i.test(c));
-  const hasRev = columns.some((c) => /revenue|sales/i.test(c));
+function isRateLikeForSuggestion(col) {
+  return /\b(rate|pct|percent|percentage|score|ratio|nps|csat|margin|index|satisfaction)\b/i.test(
+    String(col)
+  );
+}
 
-  if (hasRegion && !lower.includes("region")) {
-    chips.push("Compare revenue by region");
+function pickMetricForSuggestions(rows, columns, numericCols) {
+  if (!numericCols.length) return null;
+  const pool = numericCols.filter((c) => !isRateLikeForSuggestion(c));
+  const use = pool.length ? pool : numericCols;
+  let best = use[0];
+  let bestSum = -Infinity;
+  for (const c of use) {
+    const s = sumColumn(rows, c);
+    if (s > bestSum) {
+      bestSum = s;
+      best = c;
+    }
   }
-  if (hasProduct && !lower.includes("product")) {
-    chips.push("Top 5 products by revenue");
+  return best;
+}
+
+function pickDimensionForSuggestions(columns, numericCols, dateCol) {
+  const numSet = new Set(numericCols);
+  const cats = (columns || []).filter((c) => c && !numSet.has(c) && c !== dateCol);
+  if (!cats.length) return null;
+  const ranked = [...cats].sort((a, b) => {
+    const score = (name) => {
+      const low = String(name).toLowerCase();
+      let s = 0;
+      if (/department|region|agent|product|category|segment|channel|team|country|sku/i.test(low)) s += 3;
+      return s;
+    };
+    return score(b) - score(a);
+  });
+  return ranked[0];
+}
+
+/** Follow-up chips use real CSV column names only (no hardcoded "revenue", etc.). */
+function suggestFollowUps({ columns, question, dateCol, rows }) {
+  const lower = String(question || "").toLowerCase();
+  if (!columns?.length) return [];
+
+  const data = Array.isArray(rows) ? rows : [];
+  const numericCols = data.length ? getNumericColumns(data, columns) : [];
+
+  const metric = pickMetricForSuggestions(data, columns, numericCols);
+  const dim = pickDimensionForSuggestions(columns, numericCols, dateCol);
+
+  const chips = [];
+  if (metric && dim) {
+    const dimLow = String(dim).toLowerCase();
+    if (!lower.includes(dimLow)) {
+      chips.push(`Compare ${metric} by ${dim}`);
+    }
   }
-  if (dateCol && !/\b(mom|month|trend)\b/i.test(lower)) {
-    chips.push("Show revenue trend over time");
+  if (metric && dateCol && !/\b(trend|over time|mom|wow|month over)\b/i.test(lower)) {
+    chips.push(`Show ${metric} trend over time`);
   }
-  if (hasRev && chips.length < 3) {
-    chips.push("Why did revenue change month over month?");
+  if (metric && dim) {
+    chips.push(`Which ${dim} has the highest ${metric}?`);
   }
-  if (chips.length < 2) {
-    chips.push("Summarize the main numeric columns");
-    chips.push("Chart revenue by category if available");
+
+  const uniq = [...new Set(chips)].filter(Boolean);
+  if (uniq.length >= 3) return uniq.slice(0, 3);
+
+  if (metric && columns.length) {
+    const other = columns.find((c) => c && c !== metric && c !== dateCol);
+    if (other && !uniq.some((u) => u.includes(other))) {
+      uniq.push(`Compare ${metric} by ${other}`);
+    }
   }
-  return [...new Set(chips)].slice(0, 3);
+  if (uniq.length < 2 && metric) {
+    uniq.push(`Total ${metric} across the dataset`);
+  }
+  if (uniq.length < 2 && columns[0]) {
+    uniq.push(`Summarize key columns including ${columns[0]}`);
+  }
+
+  return [...new Set(uniq)].slice(0, 3);
 }
 
 /**

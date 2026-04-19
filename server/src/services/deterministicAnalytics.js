@@ -10,10 +10,12 @@ const {
   pearsonCorrelation,
   getNumericColumns,
   findPerfectCategoricalCorrelations,
+  inferDatasetTemporalGranularity,
 } = require("../utils/datasetAnalysis");
 const { filterRowsBySortKeyRange, maxSortKeyInRows, sortKeyToYmd, ymdToSortKey } = require("./timeResolver");
 const { extractEntityPair, isRelativeTimeEntityPair } = require("./intentParser");
 const { findColumnForAliases } = require("./metricResolver");
+const { pickSummaryMetricColumn, formatIdForValue, computeSummaryBucketsWithFallback } = require("../lib/summaryHelpers");
 
 const DIMENSION_ALIASES = {
   Region: ["region", "area", "zone", "territory", "geo", "geography", "location"],
@@ -1108,57 +1110,75 @@ function trySummary(intent, rows, columns, metrics, dateCol) {
   }
 
   const temporal = dateCol || detectTemporalColumn(columns);
-  const col = metrics.columnMap[metrics.primaryMetricId] || metrics.primaryColumn;
+  const col =
+    pickSummaryMetricColumn(intent.rawQuestion || "", rows, columns) ||
+    metrics.columnMap[metrics.primaryMetricId] ||
+    metrics.primaryColumn;
   if (!temporal || !col) return null;
 
-  let grain = "month";
-  if (intent.isWeeklySummary) grain = "week";
-  if (intent.isDailySummary) grain = "day";
-  if (wantsMonthlyAnalysisPhrases && !intent.isWeeklySummary && !intent.isDailySummary) grain = "month";
+  let requestedGrain = "month";
+  if (intent.isDailySummary) requestedGrain = "day";
+  else if (intent.isWeeklySummary) requestedGrain = "week";
+  else if (intent.isMonthlySummary || wantsMonthlyAnalysisPhrases) requestedGrain = "month";
 
-  const buckets = groupByTime(
-    rows,
-    temporal,
-    [col],
-    /\b(avg|average|rate|%)\b/i.test(intent.rawQuestion || "") ? "avg" : "sum"
-  );
-  if (buckets.length === 0) return null;
+  const agg = /\b(avg|average|rate|%)\b/i.test(intent.rawQuestion || "") ? "avg" : "sum";
+  const formatId = formatIdForValue(metrics, col);
 
-  const last = buckets[buckets.length - 1];
-  const prev = buckets.length > 1 ? buckets[buckets.length - 2] : null;
-  const vLast = last[col] ?? 0;
-  const vPrev = prev ? prev[col] ?? 0 : null;
+  try {
+    const { buckets, effectiveGrain, prefix } = computeSummaryBucketsWithFallback(
+      rows,
+      temporal,
+      col,
+      agg,
+      requestedGrain
+    );
+    if (buckets.length === 0) return null;
 
-  const grainPhrase =
-    grain === "day" ? "day" : grain === "week" ? "week" : grain === "month" ? "month" : "period";
-  let answer = `The most recent **${grainPhrase}** in your data is **${last.label}**, with **${col}** at **${formatVal(
-    metrics.primaryMetricId,
-    vLast
-  )}**.`;
-  if (prev && vPrev !== null) {
-    const p = pctChange(vLast, vPrev);
-    answer += ` The **${grainPhrase}** before that is **${prev.label}** at **${formatVal(metrics.primaryMetricId, vPrev)}**`;
-    if (p !== null) answer += ` (${p >= 0 ? "+" : ""}${p.toFixed(1)}% vs the prior ${grainPhrase}).`;
-    if (p !== null) {
-      answer += ` Trend vs prior ${grainPhrase}: **${p >= 0 ? "up" : "down"}**.`;
-      const absP = Math.abs(p);
-      if (absP < 0.5) answer += " Movement vs the prior period is very small.";
-      else if (absP < 5) answer += " Change vs the prior period is modest.";
-      else answer += " This is a sizeable change vs the prior period.";
+    const last = buckets[buckets.length - 1];
+    const prev = buckets.length > 1 ? buckets[buckets.length - 2] : null;
+    const vLast = last[col] ?? 0;
+    const vPrev = prev ? prev[col] ?? 0 : null;
+
+    const grainPhrase = effectiveGrain === "day" ? "day" : effectiveGrain === "week" ? "week" : "month";
+
+    let answer =
+      prefix +
+      `The most recent **${grainPhrase}** in your data is **${last.label}**, with **${col}** at **${formatVal(
+        formatId,
+        vLast
+      )}**.`;
+    if (prev && vPrev !== null) {
+      const p = pctChange(vLast, vPrev);
+      answer += ` The **${grainPhrase}** before that is **${prev.label}** at **${formatVal(formatId, vPrev)}**`;
+      if (p !== null) answer += ` (${p >= 0 ? "+" : ""}${p.toFixed(1)}% vs the prior ${grainPhrase}).`;
+      if (p !== null) {
+        answer += ` Trend vs prior ${grainPhrase}: **${p >= 0 ? "up" : "down"}**.`;
+        const absP = Math.abs(p);
+        if (absP < 0.5) answer += " Movement vs the prior period is very small.";
+        else if (absP < 5) answer += " Change vs the prior period is modest.";
+        else answer += " This is a sizeable change vs the prior period.";
+      }
     }
-  }
 
-  return buildRichBase({
-    answer,
-    resolvedMetric: metrics.primaryMetricId,
-    resolvedTimeRange: { label: last.label, grain },
-    chartData: {
-      labels: buckets.slice(-20).map((b) => b.label),
-      values: buckets.slice(-20).map((b) => b[col] ?? 0),
-      type: "line",
-    },
-    evidence: { buckets: buckets.slice(-24) },
-  });
+    return buildRichBase({
+      answer,
+      resolvedMetric: formatId,
+      resolvedTimeRange: { label: last.label, grain: grainPhrase },
+      chartData: {
+        labels: buckets.slice(-20).map((b) => b.label),
+        values: buckets.slice(-20).map((b) => b[col] ?? 0),
+        type: "line",
+      },
+      evidence: { buckets: buckets.slice(-24) },
+    });
+  } catch (_e) {
+    return buildRichBase({
+      answer:
+        "Could not build that daily or weekly summary from the timeline in this upload. Try a monthly summary, or check that the date column parses cleanly.",
+      resolvedMetric: metrics.primaryMetricId,
+      evidence: { summaryFailed: true },
+    });
+  }
 }
 
 function tryAnomaly(intent, rows, columns, metrics, dateCol) {

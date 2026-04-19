@@ -147,7 +147,7 @@ describe("timeResolver + driver window", () => {
 });
 
 describe("groupByTime (year-month buckets)", () => {
-  it("keeps 24 distinct buckets for two calendar years of month names in file order", () => {
+  it("collapses duplicate calendar-month names across years into 12 buckets (month-name labels)", () => {
     const monthNames = [
       "January",
       "February",
@@ -169,18 +169,29 @@ describe("groupByTime (year-month buckets)", () => {
       }
     }
     const buckets = groupByTime(rows, "period", ["revenue"], "sum");
-    expect(buckets.length).toBe(24);
-    expect(buckets[0].label).toMatch(/^\d{4}-\d{2}$/);
-    expect(buckets[23].label).toMatch(/^\d{4}-\d{2}$/);
+    expect(buckets.length).toBe(12);
+    expect(buckets[0].label).toBe("January");
+    expect(buckets[11].label).toBe("December");
   });
 
-  it("labels ISO months as YYYY-MM (chronological key)", () => {
+  it("labels ISO date months as Mon YYYY (chronological key)", () => {
     const rows = [
       { d: "2023-01-01", v: 1 },
       { d: "2024-01-01", v: 2 },
     ];
     const buckets = groupByTime(rows, "d", ["v"], "sum");
-    expect(buckets.map((b) => b.label)).toEqual(["2023-01", "2024-01"]);
+    expect(buckets.map((b) => b.label)).toEqual(["Jan 2023", "Jan 2024"]);
+  });
+
+  it("day grain buckets by YYYY-MM-DD without collapsing same month", () => {
+    const rows = [
+      { d: "2024-01-05", v: 1 },
+      { d: "2024-01-20", v: 2 },
+    ];
+    const buckets = groupByTime(rows, "d", ["v"], "sum", "day");
+    expect(buckets.length).toBe(2);
+    expect(buckets[0].label).toBe("2024-01-05");
+    expect(buckets[1].label).toBe("2024-01-20");
   });
 });
 
@@ -349,7 +360,7 @@ describe("deterministicAnalytics", () => {
     });
     expect(ruled).toBeTruthy();
     expect(ruled.answer).toMatch(/gross_profit/);
-    expect(ruled.answer).toMatch(/1/);
+    expect(ruled.answer).toMatch(/\*\*2\*\* rows/);
   });
 
   it("rule engine returns exactly N groups for top-N when possible", () => {

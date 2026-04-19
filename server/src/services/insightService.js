@@ -1,29 +1,21 @@
 /**
- * insightService.js — Hybrid insight orchestrator.
- *
- * Routing flow:
- *   1. Validate + normalise dataset
- *   2. Ambiguous relative time → clarifying question (no silent pick)
- *   3. Categorical filters from the question
- *   4. Deterministic → rules → Groq
- *   5. Data-used metadata, optional numeric verification (AI), follow-up chips
+ * insightService.js — Deterministic-first orchestrator + explain-only LLM.
  */
 
+const crypto = require("crypto");
 const { tryRuleBasedAnswer } = require("./ruleBasedQuery");
 const { askGroqForInsight } = require("./groqService");
 const { runDeterministicPipeline } = require("./deterministicAnalytics");
 const { parseIntent } = require("./intentParser");
+const { detectIntent: detectIntentLabel } = require("./intentClassifier");
+const { buildStructuredQuery } = require("./structuredQuery");
 const { resolveMetrics } = require("./metricResolver");
 const { findBestDateColumn, resolveComparisonWindows, filterRowsBySortKeyRange } = require("./timeResolver");
 const {
   inferColumnsFromRows,
   getNumericColumns,
-  groupBy,
-  groupByTime,
-  summaryStats,
   detectTemporalColumn,
-  detectGroupColumn,
-  representativeSample,
+  parseNumber,
 } = require("../utils/datasetAnalysis");
 const { filterDataset } = require("../utils/filterDataset");
 const { detectAmbiguousRelativeTime } = require("../lib/ambiguousTime");
@@ -34,9 +26,45 @@ const {
   tryInferChartFromRows,
 } = require("../lib/responseExtras");
 const { verifyAnswerAgainstRows, applyVerifiedCurrency } = require("../lib/answerVerifier");
+const {
+  buildMissingReferencedMetricMessage,
+  buildUnmatchedQuestionMessage,
+} = require("../lib/insightFallbackMessages");
+const { applyNumericGuardrails } = require("./verifier");
 const { datasetStore } = require("../utils/datasetStore");
+const {
+  comparisonAnalysis,
+  trendAnalysis,
+  breakdownAnalysis,
+  summaryAnalysis,
+  driverAnalysis,
+  looksLikePairwiseComparisonQuestion,
+} = require("./queryAnalysis");
 
-const LARGE_DATASET_THRESHOLD = 200;
+const insightCache = new Map();
+const CACHE_MAX = 200;
+const CACHE_TTL_MS = 120_000;
+
+function datasetFingerprint(columns, rowCount) {
+  return crypto.createHash("sha256").update(`${(columns || []).join("|")}#${rowCount}`).digest("hex").slice(0, 24);
+}
+
+function cacheGet(key) {
+  const e = insightCache.get(key);
+  if (!e) return null;
+  if (Date.now() > e.exp) {
+    insightCache.delete(key);
+    return null;
+  }
+  return e.value;
+}
+
+function cacheSet(key, value) {
+  if (insightCache.size > CACHE_MAX) {
+    insightCache.delete(insightCache.keys().next().value);
+  }
+  insightCache.set(key, { value, exp: Date.now() + CACHE_TTL_MS });
+}
 
 function isSourceTransparencyQuestion(q) {
   const s = String(q || "").toLowerCase();
@@ -70,10 +98,6 @@ function questionWantsTrend(q) {
   return /\b(trend|over time|progress|growth|decline|change|month.over|year.over|increase|decrease|fluctuat)\b/i.test(q);
 }
 
-function questionWantsGroupBy(q) {
-  return /\b(by |per |each |breakdown|group|segment|categor)\b/i.test(q);
-}
-
 function sanitizeChartData(chartData) {
   if (!chartData || typeof chartData !== "object") return undefined;
   const labels = Array.isArray(chartData.labels) ? chartData.labels.map(String) : [];
@@ -99,11 +123,26 @@ function columnsUsedFromContext(metrics, dateCol, deterministic) {
   return [...set];
 }
 
+function mapSource(rawSource) {
+  if (rawSource === "AI") return "AI";
+  /* "rule-based" keeps ChatPanel SourceBadge working (computed path). */
+  return "rule-based";
+}
+
+function pickConfidence(raw, mappedSource) {
+  if (raw?.confidence === "high" || raw?.confidence === "medium" || raw?.confidence === "low") {
+    return raw.confidence;
+  }
+  if (mappedSource === "AI") return "medium";
+  return "high";
+}
+
 function shapeApiResponse(raw, extras = {}) {
   const answer0 = typeof raw?.answer === "string" ? raw.answer : "";
-  const source = raw?.source === "AI" ? "AI" : "rule-based";
+  const source = mapSource(raw?.source);
+  const confidence = pickConfidence(raw, source);
   const chartData = sanitizeChartData(raw?.chartData);
-  const out = { answer: answer0, source };
+  const out = { answer: answer0, source, confidence };
   if (chartData) out.chartData = chartData;
   if (extras.dataUsed) out.dataUsed = extras.dataUsed;
   if (Array.isArray(extras.suggestedQuestions) && extras.suggestedQuestions.length) {
@@ -113,71 +152,31 @@ function shapeApiResponse(raw, extras = {}) {
   return out;
 }
 
-function buildLLMPayload({ question, rows, columns }) {
-  const numericCols = getNumericColumns(rows, columns);
-  const temporalCol = detectTemporalColumn(columns);
-  const isTrendQuery = questionWantsTrend(question);
-
-  if (isTrendQuery && temporalCol && numericCols.length > 0) {
-    const avgKeywords = /\b(price|rate|ratio|score|rating|index|temperature|avg|average|mean|percent|%)\b/i;
-    const agg = avgKeywords.test(question) ? "avg" : "sum";
-
-    const timeBuckets = groupByTime(rows, temporalCol, numericCols.slice(0, 5), agg);
-
-    if (timeBuckets.length >= 2) {
-      const aggregatedRows = timeBuckets.map((b) => {
-        const r = { [temporalCol]: b.label };
-        for (const col of numericCols.slice(0, 5)) {
-          if (b[col] !== undefined) r[col] = parseFloat((b[col] || 0).toFixed(4));
-        }
-        return r;
-      });
-
-      return {
-        rows: aggregatedRows,
-        columns: [temporalCol, ...numericCols.slice(0, 5)],
-        _meta: { aggregated: true, agg, buckets: timeBuckets.length, originalRows: rows.length },
-      };
-    }
-  }
-
-  if (rows.length <= LARGE_DATASET_THRESHOLD) {
-    return { rows, columns };
-  }
-
-  const categoricalCol = detectGroupColumn(rows, columns, numericCols);
-  const stats = summaryStats(rows, columns);
-  const groupedResults = [];
-
-  if (numericCols.length > 0) {
-    const primaryGroupCol = isTrendQuery && temporalCol
-      ? temporalCol
-      : categoricalCol || temporalCol;
-
-    if (primaryGroupCol) {
-      const grouped = groupBy(rows, primaryGroupCol, numericCols.slice(0, 4));
-      if (grouped.length > 0) groupedResults.push({ groupCol: primaryGroupCol, groups: grouped });
-    }
-
-    if (questionWantsGroupBy(question) && temporalCol && categoricalCol && temporalCol !== categoricalCol) {
-      const grouped2 = groupBy(rows, categoricalCol, numericCols.slice(0, 4));
-      if (grouped2.length > 0) groupedResults.push({ groupCol: categoricalCol, groups: grouped2 });
-    }
-  }
-
-  return {
-    rows,
-    columns,
-    _meta: { stats, groupedResults, sampleRows: representativeSample(rows, 40), totalRows: rows.length },
-  };
-}
-
 function attachFinalAnswer(base, meta, verificationNote) {
   let answer = appendDataUsedIfMissing(base.answer, meta);
   if (verificationNote) {
     answer += `\n\n${verificationNote}`;
   }
   return { ...base, answer, verificationNote: verificationNote || undefined };
+}
+
+function computedSummaryForGuardrails(metrics, pipelineRows) {
+  const col = metrics?.primaryColumn;
+  if (!col) return null;
+  let sum = 0;
+  for (const r of pipelineRows || []) {
+    const n = parseNumber(r?.[col]);
+    if (n !== null) sum += n;
+  }
+  const looksCurrency = /revenue|sales|cost|spend|price|amount|profit|income/i.test(col);
+  const bulletFacts = looksCurrency
+    ? `**Computed total (${col}):** $${sum.toLocaleString("en-US", { minimumFractionDigits: 2, maximumFractionDigits: 2 })}`
+    : `**Computed total (${col}):** ${sum.toLocaleString("en-US", { maximumFractionDigits: 4 })}`;
+  return {
+    bulletFacts,
+    currencyTargets: looksCurrency ? [sum] : [],
+    percentTargets: [],
+  };
 }
 
 /**
@@ -191,15 +190,22 @@ async function getInsight({ question, dataset }) {
       : inferColumnsFromRows(allRows);
 
   const trimmed = String(question || "").trim();
+  const fp = datasetFingerprint(columns, allRows.length);
+  const cacheKey = `${fp}::${trimmed.toLowerCase()}`;
+  const cached = cacheGet(cacheKey);
+  if (cached) return cached;
 
   if (isSourceTransparencyQuestion(trimmed)) {
     const prev = datasetStore.getLastQueryMeta();
     if (!prev) {
-      return {
+      const out = {
         answer:
           "No prior answer metadata is stored yet. Ask a data question first, then request **which columns and rows** were used.",
         source: "rule-based",
+        confidence: "high",
       };
+      cacheSet(cacheKey, out);
+      return out;
     }
     const text = [
       "Here is the **stored computation metadata** from the last answer (no new query was run):",
@@ -210,7 +216,9 @@ async function getInsight({ question, dataset }) {
       `• **Group by:** ${prev.groupBy || "none"}`,
       `• **Rows used:** ${prev.rowCount ?? "?"} of ${prev.totalRows ?? "?"} total rows in the upload`,
     ].join("\n");
-    return { answer: text, source: "rule-based" };
+    const out = { answer: text, source: "rule-based", confidence: "high" };
+    cacheSet(cacheKey, out);
+    return out;
   }
 
   const numericColumns = getNumericColumns(allRows, columns);
@@ -225,10 +233,42 @@ async function getInsight({ question, dataset }) {
   const wasFiltered = filters.length > 0 && filteredRows.length > 0;
 
   const intent = parseIntent(trimmed);
+  const intentLabel = detectIntentLabel(trimmed);
   const metrics = resolveMetrics({ question: trimmed, columns, rows });
+
+  if (metrics.missingRequestedMetricId) {
+    const answer = buildMissingReferencedMetricMessage(metrics.numericColumns);
+    const dataUsed = buildDataUsedMeta({
+      columnsUsed: columns.slice(0, 12),
+      filterDescription: wasFiltered ? filterDescription : null,
+      timeBundle: {},
+      rowCount: rows.length,
+      totalRows: allRows.length,
+    });
+    dataUsed.structuredQuery = buildStructuredQuery({
+      question: trimmed,
+      columns,
+      metrics,
+      dateCol: null,
+      rows,
+    });
+    const shaped = shapeApiResponse(
+      { answer, source: "rule-based", confidence: "low" },
+      {
+        dataUsed,
+        suggestedQuestions: suggestFollowUps({ columns, question: trimmed, dateCol: null, rows }),
+      }
+    );
+    const out = attachFinalAnswer(shaped, dataUsed, "");
+    persistQueryMeta(dataUsed, {});
+    cacheSet(cacheKey, out);
+    return out;
+  }
+
   const numericSet = new Set(getNumericColumns(rows, columns));
   const { column: resolvedDateCol } = findBestDateColumn(rows, columns, numericSet);
   const dateCol = resolvedDateCol || detectTemporalColumn(columns);
+  const structuredQuery = buildStructuredQuery({ question: trimmed, columns, metrics, dateCol, rows });
 
   const ambiguous = detectAmbiguousRelativeTime(trimmed, rows, dateCol);
   if (ambiguous?.message) {
@@ -239,16 +279,18 @@ async function getInsight({ question, dataset }) {
       rowCount: rows.length,
       totalRows: allRows.length,
     });
+    dataUsed.structuredQuery = structuredQuery;
     const shaped = shapeApiResponse(
-      { answer: ambiguous.message, source: "rule-based" },
+      { answer: ambiguous.message, source: "rule-based", confidence: "high" },
       {
         dataUsed,
-        suggestedQuestions: suggestFollowUps({ columns, question: trimmed, dateCol }),
+        suggestedQuestions: suggestFollowUps({ columns, question: trimmed, dateCol, rows }),
         clarifying: true,
       }
     );
     const out = attachFinalAnswer(shaped, dataUsed, "");
     persistQueryMeta(dataUsed, {});
+    cacheSet(cacheKey, out);
     return out;
   }
 
@@ -296,14 +338,19 @@ async function getInsight({ question, dataset }) {
       rowCount: pipelineRows.length,
       totalRows: allRows.length,
     });
-    const shaped = shapeApiResponse(merged, {
-      dataUsed,
-      suggestedQuestions: suggestFollowUps({ columns, question: trimmed, dateCol }),
-    });
+    dataUsed.structuredQuery = structuredQuery;
+    const shaped = shapeApiResponse(
+      { ...merged, source: merged.source || "rule-based", confidence: merged.confidence || "high" },
+      {
+        dataUsed,
+        suggestedQuestions: suggestFollowUps({ columns, question: trimmed, dateCol, rows: pipelineRows }),
+      }
+    );
     const out = attachFinalAnswer(shaped, dataUsed, "✓ Verified (computed from your CSV)");
     persistQueryMeta(dataUsed, {
       groupBy: (merged.resolvedDimensions && merged.resolvedDimensions.join(", ")) || null,
     });
+    cacheSet(cacheKey, out);
     return out;
   }
 
@@ -327,33 +374,96 @@ async function getInsight({ question, dataset }) {
       rowCount: pipelineRows.length,
       totalRows: allRows.length,
     });
-    const shaped = shapeApiResponse(withChart, {
-      dataUsed,
-      suggestedQuestions: suggestFollowUps({ columns, question: trimmed, dateCol }),
-    });
+    dataUsed.structuredQuery = structuredQuery;
+    const shaped = shapeApiResponse(
+      { ...withChart, source: withChart.source || "rule-based", confidence: "high" },
+      {
+        dataUsed,
+        suggestedQuestions: suggestFollowUps({ columns, question: trimmed, dateCol, rows: pipelineRows }),
+      }
+    );
     const outR = attachFinalAnswer(shaped, dataUsed, "✓ Verified (computed from your CSV)");
     persistQueryMeta(dataUsed, {});
+    cacheSet(cacheKey, outR);
     return outR;
   }
 
-  const payload = buildLLMPayload({ question: trimmed, rows: pipelineRows, columns });
+  const qaCtx = {
+    question: trimmed,
+    rows: pipelineRows,
+    columns,
+    metrics,
+    dateCol,
+    timeBundle,
+    intent,
+  };
 
-  const filterNote = wasFiltered
-    ? `[Dataset pre-filtered: ${filterDescription} — ${pipelineRows.length} of ${allRows.length} rows.]`
-    : "";
-  const aggNote = payload._meta?.aggregated
-    ? `[Data has been pre-aggregated into ${payload._meta.buckets} monthly buckets (${payload._meta.agg} per period) from ${payload._meta.originalRows} original rows. Use these aggregated values directly — do NOT re-aggregate.]`
-    : "";
-  const contextNote = [filterNote, aggNote].filter(Boolean).join(" ");
+  let qa =
+    (intentLabel === "why" && driverAnalysis(qaCtx)) ||
+    (looksLikePairwiseComparisonQuestion(trimmed) && comparisonAnalysis(qaCtx)) ||
+    ((intentLabel === "trend" || questionWantsTrend(trimmed)) && trendAnalysis(qaCtx)) ||
+    (intentLabel === "breakdown" && breakdownAnalysis(qaCtx)) ||
+    (intentLabel === "summary" &&
+      summaryAnalysis({ rows: pipelineRows, columns, metrics, dateCol, question: trimmed }));
 
-  const questionWithContext = contextNote
-    ? `${trimmed}\n\n${contextNote}`
-    : trimmed;
+  if (qa && typeof qa.answer === "string" && qa.answer.trim()) {
+    if (wasFiltered && !/\*\([^)]*Filter/i.test(qa.answer)) {
+      qa = {
+        ...qa,
+        answer: `*(Filtered: ${filterDescription} — ${pipelineRows.length} of ${allRows.length} rows)*\n\n${qa.answer}`,
+      };
+    }
+    const colsUsed = columnsUsedFromContext(metrics, dateCol, qa);
+    const dataUsed = buildDataUsedMeta({
+      columnsUsed: colsUsed.length ? colsUsed : columns.slice(0, 8),
+      filterDescription: wasFiltered ? filterDescription : null,
+      timeBundle,
+      rowCount: pipelineRows.length,
+      totalRows: allRows.length,
+    });
+    dataUsed.structuredQuery = structuredQuery;
+    const shaped = shapeApiResponse(
+      { ...qa, source: qa.source === "computed" ? "rule-based" : qa.source, confidence: qa.confidence || "high" },
+      {
+        dataUsed,
+        suggestedQuestions: suggestFollowUps({ columns, question: trimmed, dateCol, rows: pipelineRows }),
+      }
+    );
+    const outQa = attachFinalAnswer(shaped, dataUsed, "✓ Verified (computed from your CSV)");
+    persistQueryMeta(dataUsed, {});
+    cacheSet(cacheKey, outQa);
+    return outQa;
+  }
+
+  if (intentLabel === "summary" || intentLabel === "unknown") {
+    const answer = buildUnmatchedQuestionMessage(columns);
+    const colsUsed = columns.slice(0, 12);
+    const dataUsed = buildDataUsedMeta({
+      columnsUsed: colsUsed.length ? colsUsed : columns,
+      filterDescription: wasFiltered ? filterDescription : null,
+      timeBundle,
+      rowCount: pipelineRows.length,
+      totalRows: allRows.length,
+    });
+    dataUsed.structuredQuery = structuredQuery;
+    const shaped = shapeApiResponse(
+      { answer, source: "rule-based", confidence: "low" },
+      {
+        dataUsed,
+        suggestedQuestions: suggestFollowUps({ columns, question: trimmed, dateCol, rows: pipelineRows }),
+      }
+    );
+    const outFb = attachFinalAnswer(shaped, dataUsed, "");
+    persistQueryMeta(dataUsed, {});
+    cacheSet(cacheKey, outFb);
+    return outFb;
+  }
 
   let ai = await askGroqForInsight({
-    question: questionWithContext,
-    rows: payload.rows,
-    columns: payload.columns,
+    question: trimmed,
+    rows: pipelineRows,
+    columns,
+    metrics,
   });
 
   let verificationNote = "";
@@ -370,12 +480,18 @@ async function getInsight({ question, dataset }) {
     }
   }
 
+  const guardCtx = computedSummaryForGuardrails(metrics, pipelineRows);
+  if (guardCtx && ai?.source === "AI") {
+    const g = applyNumericGuardrails(ai.answer, guardCtx);
+    ai = { ...ai, answer: g.text };
+  }
+
   if (!ai.chartData) {
     const inferred = tryInferChartFromRows(trimmed, pipelineRows, columns, getNumericColumns(pipelineRows, columns));
     if (inferred) ai = { ...ai, chartData: inferred };
   }
 
-  const colsUsed = Array.isArray(payload.columns) ? payload.columns : columns.slice(0, 10);
+  const colsUsed = columns.slice(0, 12);
   const dataUsed = buildDataUsedMeta({
     columnsUsed: colsUsed,
     filterDescription: wasFiltered ? filterDescription : null,
@@ -383,14 +499,16 @@ async function getInsight({ question, dataset }) {
     rowCount: pipelineRows.length,
     totalRows: allRows.length,
   });
+  dataUsed.structuredQuery = structuredQuery;
 
   const shaped = shapeApiResponse(ai, {
     dataUsed,
-    suggestedQuestions: suggestFollowUps({ columns, question: trimmed, dateCol }),
+    suggestedQuestions: suggestFollowUps({ columns, question: trimmed, dateCol, rows: pipelineRows }),
   });
 
   const outAi = attachFinalAnswer(shaped, dataUsed, verificationNote);
   persistQueryMeta(dataUsed, {});
+  cacheSet(cacheKey, outAi);
   return outAi;
 }
 
