@@ -250,7 +250,7 @@ column names.
 
 ## Screenshots
 
-![DataSpeak Interface](screenshots/DataSpeak.png)
+![DataSpeak Interface](screenshots/DataSpeak_dashboard.png)
 
 *Built for clear answers, honest feature listing, and a transparent path
 from question to data.*
