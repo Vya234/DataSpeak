@@ -1,145 +1,256 @@
 # DataSpeak — Talk to Your Data (CSV)
 
-**DataSpeak** is a hackathon-friendly web app: upload a CSV, ask questions in plain English, and get **computed or AI-backed answers** with optional charts, **transparent “Data used”** metadata, and **verification** hooks. It is built for **clarity** (plain language + structured context), **trust** (exact column names, direction checks, no silent time guesses for vague phrases), and **speed** (deterministic paths before any LLM call).
+## Overview
 
-**Who it’s for:** demos, coursework, and anyone who wants quick CSV insights without SQL or BI tooling.
+DataSpeak is a web app that lets anyone upload a CSV file and ask 
+questions about it in plain English — no SQL, no BI tools, no technical 
+knowledge required. It instantly returns verified, deterministically 
+computed answers with charts and transparent data sources.
 
----
+**Problem it solves:** Most people struggle to get quick, accurate, and 
+trustworthy answers from data. Existing tools require SQL knowledge, 
+complex dashboards, or produce AI answers that hallucinate numbers. 
+DataSpeak removes that friction.
 
-## Features (implemented)
-
-- **CSV upload** — Parsed **server-side** (Multer + csv-parser), stored in memory for the session.
-- **Hybrid pipeline** — (1) **Deterministic** analytics (time windows, comparisons, drivers), (2) **rule-based** numeric engine, (3) **Groq (Llama 3.1)** for open-ended questions.
-- **Exact column names** — Semantic mapping never renames headers in user-facing text; prompts instruct the model to use **only** CSV headers (fixes issues like `customers` vs wrong labels).
-- **Ambiguous vague time** — Questions with only **“recently” / “latest”** (etc.) and **multiple** periods in the file get a **clarifying prompt** instead of a silent default.
-- **Wrong-direction handling** — “Why did X drop?” paths compare periods and **correct** the premise when the metric actually rose (especially with filters).
-- **Data used** — Each API response includes structured `dataUsed` (columns, filter, time window, row counts); the UI shows it in a **collapsible** section. Answers also append a **Data used** block for raw JSON consumers.
-- **Verification** — Computed answers are marked verified; AI answers can have totals checked against row sums when a single currency total appears.
-- **Charts** — **Chart.js** with axis titles when provided, legend, and tooltips showing numeric values; comparisons/breakdowns/trends from Groq shortcuts **always** return chart data when computable.
-- **Follow-up chips** — After each answer, the UI suggests **2–3** contextual next questions.
-- **Loading UX** — **“Analysing your data…”** skeleton with animated bar while the query runs.
+**Target users:** Business analysts, students, hackathon participants, 
+and anyone who needs fast insights from a CSV without writing code.
 
 ---
 
-## Tech stack
+## Features (implemented and working)
 
-| Layer | Stack |
-|--------|--------|
-| Frontend | **React**, **Vite**, **Chart.js** |
-| Backend | **Node.js**, **Express** |
-| LLM | **Groq** — `groq-sdk`, **llama-3.1-8b-instant** |
-| Upload / CSV | **Multer**, **csv-parser** |
-| Tests | **Jest**, **Supertest** |
-
----
-
-## Architecture (short)
-
-1. Browser uploads CSV → **POST /upload** → server parses and stores rows + headers.  
-2. Browser sends **POST /query** with `{ question }` → `insightService.getInsight` runs filters, optional **ambiguous-time** gate, deterministic + rules + **Groq** with a **strict system prompt** (exact columns, metric dictionary JSON, Data used rules).  
-3. Response is shaped with **`answer`**, **`source`**, optional **`chartData`**, **`dataUsed`**, **`suggestedQuestions`**.  
-4. Client renders the answer, collapsible **Data used**, **follow-up chips**, and the **Visualize** panel when `chartData` is present.
-
-Key server modules:
-
-- `server/src/services/insightService.js` — Orchestration.  
-- `server/src/lib/promptBuilder.js` — Groq system prompt.  
-- `server/src/lib/metricDictionary.js` — Per-column definitions for prompts.  
-- `server/src/lib/ambiguousTime.js` — Vague relative time → clarify.  
-- `server/src/lib/answerVerifier.js` — Post-AI numeric check.  
-- `server/src/services/deterministicAnalytics.js` — Time + driver logic.  
-- `server/src/services/groqService.js` — Shortcuts + narrative.
-
-Client layout:
-
-- `client/src/components/DatasetPanel.jsx`, `QueryPanel.jsx`, `VisualizePanel.jsx`  
-- `client/src/lib/csvParser.js` — Notes that parsing is server-side.  
-- `client/src/lib/metricDictionary.js` — Pointer to server definitions.
+- **CSV upload** — Parsed server-side (Multer + csv-parser), stored in memory for the session.
+- **Deterministic computation engine** — All numbers (sums, percentages, comparisons, trends) are computed by backend JS. The LLM never does math — it only explains pre-computed results.
+- **Intent classifier** — Detects query type (comparison, trend, breakdown, why, summary) using keyword/pattern matching with no ML dependency.
+- **Strict metric dictionary** — Maps user terms (e.g. "revenue", "tickets") to exact CSV column names. Prevents hallucinated or wrong column references.
+- **Driver analysis** — "Why" questions compute per-group period-over-period deltas ranked by absolute impact. LLM only narrates the pre-computed result.
+- **Confidence badges** — Every answer is tagged: ⚡ Computed (high confidence), ✦ AI-assisted (medium), or low confidence so users always know how the answer was produced.
+- **Numeric guardrails** — Post-LLM verification layer detects and overrides any AI numbers that disagree with server-computed values.
+- **In-memory query cache** — Dataset fingerprint + question hash avoids redundant recomputation for repeated queries.
+- **Granularity-aware summaries** — Daily, weekly, and monthly summaries respect the user's requested granularity. Falls back gracefully with an explanatory note if data is too sparse.
+- **Graceful fallback** — When a question cannot be answered, lists the available metrics from the uploaded file instead of returning confusing output.
+- **Exact column names** — Answers always use real CSV header names, never renamed or guessed labels.
+- **Ambiguous time handling** — Vague phrases like "recently" or "latest" with multiple time periods trigger a clarifying prompt instead of a silent wrong assumption.
+- **Wrong-direction handling** — "Why did X drop?" corrects the premise automatically when the metric actually rose.
+- **Data used panel** — Every response includes structured metadata (columns used, filter, time window, row counts) shown in a collapsible section.
+- **Charts** — Chart.js bar, line, and donut charts with axis titles, legends, and tooltips. Comparisons, breakdowns, and trends always include chart data when computable.
+- **Dynamic follow-up chips** — Suggested next questions are generated from actual CSV column names, never hardcoded.
+- **Loading UX** — "Analysing your data…" skeleton with animated bar while the query runs.
+- **Auto-scroll** — Chat scrolls smoothly to the latest answer after each response.
 
 ---
 
-## Dependencies
+## Tech Stack
 
-### Backend
-
-Node.js 18+, Express, Groq SDK, Multer, csv-parser, dotenv, cors, Jest, Supertest.
-
-### Frontend
-
-React, Vite, Chart.js.
+| Layer | Technology |
+|-------|-----------|
+| Frontend | React, Vite, Chart.js |
+| Backend | Node.js, Express |
+| LLM | Groq API — llama-3.1-8b-instant |
+| Upload / CSV parsing | Multer, csv-parser |
+| Tests | Jest, Supertest |
 
 ---
 
-## Install and run
+## Setup Instructions
 
-**Prerequisites:** Node.js **18+** (20+ recommended), a **Groq API key**.
+**Prerequisites:** Node.js 18+ (20+ recommended), a Groq API key
+(free at console.groq.com).
 
-1. Copy **`.env.example`** to **`.env`** at the **DataSpeak** project root (same level as `server/` and `client/`).  
-2. Set **`GROQ_API_KEY`**. Optionally set **`PORT`** (default `5000`) and **`VITE_API_URL`** if the API is not at `http://localhost:5000`.
+**Step 1 — Clone the repository:**
+```bash
+git clone <your-repo-url>
+cd DataSpeak
+```
 
+**Step 2 — Set up environment variables:**
+```bash
+cp .env.example .env
+```
+Open .env and set:
+GROQ_API_KEY=your_groq_api_key_here
+PORT=5000
+
+**Step 3 — Install dependencies:**
 ```bash
 cd server && npm install
 cd ../client && npm install
 ```
 
-**Terminal 1 — API**
+**Step 4 — Run the app (two terminals):**
 
+Terminal 1 (API server):
 ```bash
 cd server && npm run dev
 ```
 
-**Terminal 2 — UI**
-
+Terminal 2 (Frontend):
 ```bash
 cd client && npm run dev
 ```
 
-Open the Vite URL (usually `http://localhost:5173`).
+Open http://localhost:5173 in your browser.
 
-**Tests**
-
+**Step 5 — Run tests:**
 ```bash
 cd server && npm test
 ```
 
 ---
 
-## Environment variables
+## Environment Variables
 
-| Variable | Where | Purpose |
-|----------|--------|---------|
-| `GROQ_API_KEY` | Server `.env` | Groq API (required for AI path). |
-| `PORT` | Server `.env` | API port (default 5000). |
-| `VITE_API_URL` | Client env | API base URL if not localhost:5000. |
+| Variable | Location | Purpose |
+|----------|----------|---------|
+| GROQ_API_KEY | server/.env | Groq LLM API key (required) |
+| PORT | server/.env | API port (default: 5000) |
+| VITE_API_URL | client/.env | API base URL if not localhost:5000 |
 
-**Do not commit** a real `.env` or keys in source. Only **`.env.example`** belongs in the repo.
-
----
-
-## Known limitations
-
-- **CSV only**; messy files may confuse heuristics.  
-- **In-memory** dataset — lost on server restart; no multi-user persistence.  
-- **Column quality** — Dates and metrics work best with recognizable headers.  
-- **LLM** sees a **prepared subset** (aggregated or capped rows); it can still miss edge cases.  
-- **Verification** is best-effort (e.g. first currency literal vs column sum), not a full semantic proof.  
-- **Not** for regulated or secret data without your own governance.
+Never commit your real .env file. Only .env.example belongs in the repo.
 
 ---
 
-## API (`POST /query`)
+## Usage Examples
 
-Body: `{ "question": "..." }`
+**Upload a CSV** — Click the upload area in the Dataset panel and select
+any CSV file. The app shows row count, column count, and a preview.
 
-Success (typical):
+**Ask questions in plain English:**
+- "What is the total sales?" → Returns exact sum with verification badge
+- "Compare revenue by region" → Returns bar chart + ranked breakdown
+- "Why did sales drop last month?" → Returns driver analysis with top contributors
+- "Show monthly sales trend" → Returns period-over-period percentage changes
+- "Break down tickets by department" → Returns percentage breakdown with chart
+- "Give me a weekly summary" → Returns most recent week vs previous week
 
-- `answer` (string)  
-- `source`: `"rule-based"` | `"AI"`  
-- `chartData` (optional): `{ labels, values, type, valueAxisLabel?, categoryAxisLabel? }`  
-- `dataUsed`: `{ columnsUsed, filter, timeWindow, rowCount, totalRows }`  
-- `suggestedQuestions`: string[]  
-- `clarifying` (optional): `true` when the server asked for a clearer time period  
+**Example API call:**
+```bash
+curl -X POST http://localhost:5000/query \
+  -H "Content-Type: application/json" \
+  -d '{"question": "Compare revenue by region"}'
+```
+
+**Example API response:**
+```json
+{
+  "answer": "Revenue compared across Region: East: $115,800 (26.5%); West: $110,300 (25.2%)",
+  "source": "rule-based",
+  "confidence": "high",
+  "chartData": {
+    "labels": ["East","West"],
+    "values": [115800, 110300],
+    "type": "bar"
+  },
+  "dataUsed": {
+    "columnsUsed": ["Sales","Region"],
+    "rowCount": 48,
+    "totalRows": 48
+  },
+  "suggestedQuestions": [
+    "Why did East outperform West?",
+    "Show Sales trend over time"
+  ]
+}
+```
 
 ---
 
-*Built for clear answers, honest feature listing, and a transparent path from question to data.*
+## Architecture
+```text
+CSV Upload
+↓
+Server-side Parser (csv-parser + Multer)
+↓
+Dataset Fingerprint + In-memory Cache Check
+↓
+Intent Classifier (comparison / trend / breakdown / why / summary)
+↓
+Structured Query Builder (metric, groupBy, aggregation, dateColumn)
+↓
+Deterministic Computation Engine (groupBySum, timeSeries, driverAnalysis)
+↓
+[Only if needed] Groq LLM — receives pre-computed JSON, returns plain English explanation only
+↓
+Numeric Guardrails (post-LLM number verification + override)
+↓
+Confidence Badge (high / medium / low) + Response
+```
+
+**Key server modules:**
+
+| Module | Purpose |
+|--------|---------|
+| insightService.js | Main orchestration, cache, confidence assignment |
+| intentClassifier.js | Keyword/pattern intent detection |
+| computationEngine.js | groupBySum, timeSeries, computeChange, anomaly detection |
+| driverAnalysis.js | Period-over-period driver ranking by impact |
+| verifier.js | Post-LLM numeric guardrails |
+| structuredQuery.js | Builds JSON query plan from question + schema |
+| deterministicAnalytics.js | Time window and driver logic |
+| groqService.js | Explain-only LLM path (no math) |
+| promptBuilder.js | Groq system prompt builder |
+| answerVerifier.js | Currency and percent verification |
+| ambiguousTime.js | Vague time phrase detection |
+
+---
+
+## Technical Depth
+
+**Why deterministic-first?**
+Most talk-to-data tools send raw rows to an LLM and ask it to compute
+totals. LLMs are not calculators — they estimate, round incorrectly, and
+ignore filters. DataSpeak inverts this: backend JavaScript computes all
+numbers with exact arithmetic, and the LLM is only called to write a
+plain English sentence around the pre-computed result. This guarantees
+accuracy and satisfies the Trust pillar of the hackathon brief.
+
+**Why Groq + llama-3.1-8b-instant?**
+Groq's inference hardware delivers sub-second LLM responses. The 8b
+model is fast and sufficient for explanation-only tasks since it never
+needs to reason about numbers. This satisfies the Speed pillar without
+paid API tiers.
+
+**Why intent classification before LLM?**
+Routing queries through a keyword classifier first means the most common
+query types (comparison, trend, breakdown, why, summary) never touch the
+LLM at all. This reduces latency, eliminates hallucination risk for
+structured queries, and makes answers fully reproducible.
+
+**Why a metric dictionary?**
+Different users say "revenue", "sales", "income" — all meaning the same
+column. The metric dictionary creates a stable mapping from user language
+to exact CSV headers, preventing the model from guessing or inventing
+column names.
+
+---
+
+## Limitations
+
+- CSV only — Excel, JSON, and database connections are not supported.
+- In-memory storage — dataset is lost on server restart, no multi-user persistence.
+- Column quality — date and metric detection works best with recognizable header names.
+- Driver analysis covers the last 2 available time periods only.
+- Daily/weekly summary falls back to monthly if data granularity is too sparse.
+- LLM sees an aggregated subset of rows, not raw data — edge cases may be missed.
+- Verification is best-effort, not a full semantic proof.
+- Not suitable for regulated or sensitive data without additional governance.
+
+---
+
+## Future Improvements
+
+- Support for Excel (.xlsx) and JSON file formats
+- Persistent sessions and multi-user support with a database
+- Natural language to SQL preview for power users
+- Anomaly detection with automatic flagging on charts
+- Scheduled summaries (daily/weekly email digests)
+- Multi-file joins and cross-dataset comparison
+
+---
+
+## Screenshots
+
+![DataSpeak Interface](screenshots/DataSpeak.png)
+
+*Built for clear answers, honest feature listing, and a transparent path
+from question to data.*
