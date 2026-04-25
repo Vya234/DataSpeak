@@ -17,6 +17,12 @@ and anyone who needs fast insights from a CSV without writing code.
 
 ---
 
+## Dashboard
+
+![DataSpeak Interface](screenshots/DataSpeak_dashboard.png)
+
+---
+
 ## Features (implemented and working)
 
 - **CSV upload** — Parsed server-side (Multer + csv-parser), stored in memory for the session.
@@ -247,10 +253,6 @@ column names.
 - Multi-file joins and cross-dataset comparison
 
 ---
-
-## Dashboard
-
-![DataSpeak Interface](screenshots/DataSpeak_dashboard.png)
 
 *Built for clear answers, honest feature listing, and a transparent path
 from question to data.*
